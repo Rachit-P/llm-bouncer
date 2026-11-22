@@ -7,7 +7,7 @@ name = "llm-bouncer"
 version = "0.0.1"
 description = "Text labelling for LLM agents: records where every piece of text an agent reads came from."
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 dependencies = []
 
