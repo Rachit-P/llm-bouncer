@@ -6,6 +6,7 @@ Claude Code runs a hook as a command, passes JSON on stdin, and reads JSON from 
     llm-bouncer user-prompt       # UserPromptSubmit: label the developer's prompt
     llm-bouncer pre-tool-use      # PreToolUse: allow, ask or deny the next tool call
     llm-bouncer show [SESSION_ID] # print the ledger for a session
+    llm-bouncer eval [PATH] [--policy FILE] [--json] [--check]  # score the gate on attack/harmless scenarios
 
 Set LLM_BOUNCER_MODE=monitor to log pre-tool-use decisions without enforcing them.
 """
@@ -146,6 +147,10 @@ def _read_event() -> dict:
 def main(argv: Optional[list] = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     cmd = args[0] if args else ""
+    if cmd == "eval":  # outside the try: eval failures must fail loudly (CI), unlike the hooks
+        from .evals import runner
+
+        return runner.main(args[1:])
     try:
         if cmd == "post-tool-use":
             event = _read_event()

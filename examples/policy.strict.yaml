@@ -1,0 +1,59 @@
+# llm-bouncer STRICT policy example: file and command output also taint the session.
+# Catches injections planted in repo files and command output, at the cost of more asks.
+
+# Which labelled sources count as "tainted" for the ask rule.
+# file and command output can also carry attacker text; add them for a stricter mode.
+taint_sources: [web, mcp, tool, user_pasted, file, command]
+
+# What to do when a risky action echoes a URL, email or command that appeared in tainted text.
+on_echo: deny        # deny | ask
+# What to do when a risky action runs after tainted text was read in this session.
+on_risky_after_taint: ask   # ask | deny | allow
+
+# Risky Bash commands, by category (Python regex, case-insensitive).
+bash_risky:
+  download_and_execute:
+    - '(curl|wget)\b[^|;&]*\|\s*(sudo\s+)?(ba|z)?sh\b'
+    - 'bash\s+<\('
+    - '\b(python3?|node|perl|ruby)\s+-[ce]\b'
+    - '\beval\b'
+    - 'base64\s+(-d|--decode)'
+  send_data_out:
+    - 'curl\b.*\s(-d|--data\S*|-F|--form|-T|--upload-file)\b'
+    - 'wget\b.*--post'
+    - '\b(nc|ncat|netcat|scp|sftp|rsync)\b'
+  secrets:
+    - '(\.env\b|id_rsa|id_ed25519|\.ssh/|\.aws/credentials|\.npmrc|\.netrc|\.git-credentials|\.pypirc)'
+    - '\b(printenv|env)\b\s*($|\|)'
+  publish:
+    - '\bgit\s+push\b'
+    - '\bnpm\s+publish\b'
+    - '\btwine\s+upload\b'
+    - '\bgh\s+(pr|release|repo|gist)\s+create\b'
+  destructive:
+    - '\brm\s+-[a-z]*r[a-z]*f?\s+(/|~|\$HOME)'
+    - '\bchmod\s+(-R\s+)?777\b'
+    - '\bsudo\b'
+
+# Writing or editing these paths is risky (agent config, CI, shell startup, secrets).
+sensitive_paths:
+  - '(^|/)\.env(\.|$)'
+  - '(^|/)\.claude/'
+  - '(^|/)\.github/workflows/'
+  - '(^|/)\.git/hooks/'
+  - '(^|/)\.(bashrc|zshrc|profile|bash_profile)$'
+  - '(^|/)\.ssh/'
+  - '(^|/)\.aws/'
+
+# Reading these paths is risky (secrets the agent could then send out).
+secret_paths:
+  - '(^|/)\.env(\.|$)'
+  - '(^|/)\.ssh/'
+  - '(^|/)\.aws/credentials$'
+  - '(^|/)\.(npmrc|netrc|pypirc|git-credentials)$'
+
+# MCP tool names that act on the outside world.
+mcp_risky_name: '(send|post|create|delete|remove|update|write|push|merge|email|message|comment|publish|transfer|pay)'
+
+# A fetched URL with a very long query string may be smuggling data out.
+max_fetch_query_chars: 120
