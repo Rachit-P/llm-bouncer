@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import time
-from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional
 
@@ -69,25 +68,49 @@ def trust_for(source: SourceType) -> Trust:
     return _TRUST[source]
 
 
-@dataclass
 class Label:
-    """One ledger entry: a fact about one piece of text the agent saw."""
+    """One ledger entry: a fact about one piece of text the agent saw.
 
-    session_id: str
-    turn: int
-    source_type: str
-    trust: str
-    origin: str  # e.g. URL, file path, command, MCP tool name
-    tool_name: Optional[str]
-    chars: int
-    sha256: str
-    flags: List[str] = field(default_factory=list)  # deterministic findings (hidden text, ...)
-    hints: List[dict] = field(default_factory=list)  # heuristic instruction-like spans (hint only)
-    indicators: Dict[str, List[str]] = field(default_factory=dict)  # URLs, emails, commands (untrusted only)
-    ts: float = field(default_factory=time.time)
+    A plain class rather than a dataclass: `dataclasses` pulls in `inspect`, which cost about a
+    sixth of every hook's start-up time.
+    """
+
+    __slots__ = ("session_id", "turn", "source_type", "trust", "origin", "tool_name", "chars", "sha256",
+                 "flags", "hints", "indicators", "ts")
+
+    def __init__(
+        self,
+        session_id: str,
+        turn: int,
+        source_type: str,
+        trust: str,
+        origin: str,  # e.g. URL, file path, command, MCP tool name
+        tool_name: Optional[str],
+        chars: int,
+        sha256: str,
+        flags: Optional[List[str]] = None,  # deterministic findings (hidden text, ...)
+        hints: Optional[List[dict]] = None,  # heuristic instruction-like spans (hint only)
+        indicators: Optional[Dict[str, List[str]]] = None,  # URLs, emails, commands (untrusted only)
+        ts: Optional[float] = None,
+    ) -> None:
+        self.session_id = session_id
+        self.turn = turn
+        self.source_type = source_type
+        self.trust = trust
+        self.origin = origin
+        self.tool_name = tool_name
+        self.chars = chars
+        self.sha256 = sha256
+        self.flags = flags or []
+        self.hints = hints or []
+        self.indicators = indicators or {}
+        self.ts = time.time() if ts is None else ts
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        return {k: getattr(self, k) for k in self.__slots__}
+
+    def __repr__(self) -> str:
+        return f"Label({self.to_dict()!r})"
 
 
 def digest(text: str) -> str:

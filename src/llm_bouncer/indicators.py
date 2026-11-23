@@ -34,14 +34,14 @@ _CMD_LINE = re.compile(
 MAX_PER_KIND = 25
 
 
-def _norm(s: str) -> str:
+def _tidy(s: str) -> str:
     return re.sub(r"\s+", " ", s.strip()).rstrip(".,;:")
 
 
 def _uniq(items: List[str]) -> List[str]:
     seen, out = set(), []
     for it in items:
-        it = _norm(it)
+        it = _tidy(it)
         if len(it) >= 6 and it.lower() not in seen:
             seen.add(it.lower())
             out.append(it[:300])

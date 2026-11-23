@@ -5,16 +5,13 @@ Everything here is deterministic: regexes and set lookups over the tool call and
 
 from __future__ import annotations
 
+import json
 import os
 import re
-from dataclasses import dataclass, field
 from functools import lru_cache
-from importlib import resources
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 from urllib.parse import parse_qsl, urlparse
-
-import yaml
 
 from .textnorm import norm, one_line
 
@@ -22,16 +19,26 @@ ALLOW, ASK, DENY = "allow", "ask", "deny"
 _ACTIONS = (ALLOW, ASK, DENY)
 
 
-@dataclass
 class Decision:
-    action: str  # allow | ask | deny
-    reason: str = ""
-    risk: List[str] = field(default_factory=list)
-    echoes: List[str] = field(default_factory=list)
+    __slots__ = ("action", "reason", "risk", "echoes")
+
+    def __init__(self, action: str, reason: str = "", risk: Optional[List[str]] = None,
+                 echoes: Optional[List[str]] = None) -> None:
+        self.action = action  # allow | ask | deny
+        self.reason = reason
+        self.risk = risk or []
+        self.echoes = echoes or []
+
+    def __repr__(self) -> str:
+        return f"Decision({self.action!r}, risk={self.risk!r}, echoes={self.echoes!r})"
 
 
 class PolicyError(ValueError):
     pass
+
+
+BUILTIN = ":builtin:"  # LLM_BOUNCER_POLICY value meaning "ignore any user policy" (used by eval)
+_DEFAULT_PATH = Path(__file__).parent / "policies" / "default.yaml"
 
 
 # ---------------------------------------------------------------- loading
@@ -44,6 +51,8 @@ def _policy_path() -> Optional[Path]:
     could ship one that switches the gate off.
     """
     env = os.environ.get("LLM_BOUNCER_POLICY")
+    if env == BUILTIN:
+        return None
     if env:
         return Path(env)  # missing file -> error -> fail closed, so a typo is noticed
     user = Path.home() / ".llm-bouncer" / "policy.yaml"
@@ -51,7 +60,7 @@ def _policy_path() -> Optional[Path]:
 
 
 def _default_text() -> str:
-    return resources.files("llm_bouncer").joinpath("policies/default.yaml").read_text(encoding="utf-8")
+    return _DEFAULT_PATH.read_text(encoding="utf-8")
 
 
 def _validate(pol: Dict[str, Any]) -> Dict[str, Any]:
@@ -70,8 +79,9 @@ def _validate(pol: Dict[str, Any]) -> Dict[str, Any]:
     return pol
 
 
-@lru_cache(maxsize=8)
-def _load(path: Optional[str]) -> Dict[str, Any]:
+def _parse(path: Optional[str]) -> Dict[str, Any]:
+    import yaml  # imported only on a cache miss: it is the slowest import in the package
+
     pol = yaml.safe_load(_default_text()) or {}
     if path:
         user = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
@@ -81,6 +91,43 @@ def _load(path: Optional[str]) -> Dict[str, Any]:
         # instead of silently dropping every rule it leaves out.
         pol.update(user)
     return _validate(pol)
+
+
+def _cache_key(path: Optional[str]) -> str:
+    parts = []
+    for f in (str(_DEFAULT_PATH), path):
+        if f:
+            st = os.stat(f)  # a missing user policy raises here -> fail closed
+            parts.append(f"{f}:{st.st_mtime_ns}:{st.st_size}")
+    return "|".join(parts)
+
+
+@lru_cache(maxsize=8)
+def _load(path: Optional[str]) -> Dict[str, Any]:
+    """Parsed, merged, validated policy, cached as JSON next to the ledgers.
+
+    Every hook is a fresh process, so without this each tool call imported PyYAML and parsed
+    and validated the policy again. The cache is keyed on the files' mtime and size.
+    """
+    key = _cache_key(path)
+    from .ledger import ledger_dir
+
+    cache = ledger_dir() / "policy.cache.json"
+    try:
+        cached = json.loads(cache.read_text(encoding="utf-8"))
+        if cached.get("key") == key:
+            return cached["policy"]
+    except (OSError, ValueError, AttributeError, KeyError):
+        pass
+    pol = _parse(path)
+    try:
+        cache.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        tmp = cache.with_name(f".policy.cache.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps({"key": key, "policy": pol}), encoding="utf-8")
+        os.replace(tmp, cache)
+    except OSError:
+        pass  # caching is an optimisation only
+    return pol
 
 
 def load_policy(cwd: Optional[str] = None) -> Dict[str, Any]:
@@ -195,12 +242,16 @@ def _url_key(url: str) -> str:
     return u.rstrip("/.,;:")
 
 
-def find_echoes(tool_input: Any, tainted_rows: List[dict]) -> List[str]:
-    """Indicators from tainted text that reappear in this tool call."""
+def find_echoes(tool_input: Any, tainted: List[dict]) -> List[str]:
+    """Indicators from tainted text that reappear in this tool call.
+
+    `tainted` is a list of ledger rows or state source summaries: anything with indicator lists
+    under "commands", "urls" and "emails" (rows nest them under "indicators").
+    """
     haystack = norm("\n".join(_strings(tool_input)))
     hits: List[str] = []
-    for row in tainted_rows:
-        ind = row.get("indicators") or {}
+    for row in tainted:
+        ind = row.get("indicators") or row
         for kind in ("commands", "urls", "emails"):
             for item in ind.get(kind, []):
                 if kind == "commands":
@@ -220,34 +271,31 @@ def find_echoes(tool_input: Any, tainted_rows: List[dict]) -> List[str]:
 
 
 def decide(tool_name: str, tool_input: Any, ledger_rows: List[dict], policy: Dict[str, Any]) -> Decision:
+    """Decide from raw ledger rows (kept for callers and tests that have rows)."""
+    from .ledger import state_from_rows
+
+    return decide_from_state(tool_name, tool_input, state_from_rows(ledger_rows), policy)
+
+
+def decide_from_state(tool_name: str, tool_input: Any, state: Dict[str, Any], policy: Dict[str, Any]) -> Decision:
     risks = classify(tool_name, tool_input, policy)
     if not risks:
         return Decision(ALLOW)
     always = set(policy.get("always_ask_risks") or []).intersection(risks)
     taint_sources = set(policy.get("taint_sources") or [])
-    tainted = [r for r in ledger_rows if r.get("source_type") in taint_sources]
+    sources = state.get("sources") or {}
+    tainted = [v for k, v in sources.items() if k in taint_sources and v.get("count")]
     if not tainted:
         if always:
-            return Decision(
-                ASK,
-                f"llm-bouncer: this call touches llm-bouncer's own files or settings ({', '.join(sorted(always))}). "
-                "Approve only if you asked for this.",
-                risks,
-            )
+            return Decision(ASK, f"llm-bouncer: touches llm-bouncer itself ({', '.join(sorted(always))}). Approve only if you asked.", risks)
         return Decision(ALLOW, risk=risks)
-    origins = ", ".join(dict.fromkeys(one_line(r.get("origin", "?"), 80) for r in tainted[-3:]))
+    origins = ", ".join(dict.fromkeys(one_line(o, 60) for v in tainted for o in v.get("origins", [])[-2:]))
     echoes = find_echoes(tool_input, tainted)
     if echoes:
-        reason = (
-            f"llm-bouncer: this {', '.join(risks)} action repeats text that came from untrusted content "
-            f"(\"{one_line(echoes[0], 100)}\"), not from you. Untrusted sources this session: {origins}."
-        )
+        reason = f"llm-bouncer: {', '.join(risks)} repeats untrusted text (\"{one_line(echoes[0], 80)}\") from {origins}."
         return Decision(policy.get("on_echo", DENY), reason, risks, echoes)
     action = policy.get("on_risky_after_taint", ASK)
     if action == ALLOW and always:
         action = ASK
-    reason = (
-        f"llm-bouncer: risky action ({', '.join(risks)}) after the agent read untrusted content "
-        f"this session ({origins}). Approve only if you asked for this."
-    )
+    reason = f"llm-bouncer: {', '.join(risks)} after reading untrusted content ({origins}). Approve only if you asked."
     return Decision(action, reason, risks)
