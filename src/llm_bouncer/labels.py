@@ -6,7 +6,7 @@ import hashlib
 import time
 from dataclasses import asdict, dataclass, field
 from enum import Enum
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 
 class SourceType(str, Enum):
@@ -70,6 +70,7 @@ class Label:
     sha256: str
     flags: List[str] = field(default_factory=list)  # deterministic findings (hidden text, ...)
     hints: List[dict] = field(default_factory=list)  # heuristic instruction-like spans (hint only)
+    indicators: Dict[str, List[str]] = field(default_factory=dict)  # URLs, emails, commands (untrusted only)
     ts: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict:

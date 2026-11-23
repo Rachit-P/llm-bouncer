@@ -1,12 +1,13 @@
-"""Claude Code hook entry points (v0: labelling only).
+"""Claude Code hook entry points.
 
 Claude Code runs a hook as a command, passes JSON on stdin, and reads JSON from stdout.
 
     llm-bouncer post-tool-use     # PostToolUse: label what a tool just returned
     llm-bouncer user-prompt       # UserPromptSubmit: label the developer's prompt
+    llm-bouncer pre-tool-use      # PreToolUse: allow, ask or deny the next tool call
     llm-bouncer show [SESSION_ID] # print the ledger for a session
 
-v0 never blocks anything. It records labels and adds a short note for the model.
+Set LLM_BOUNCER_MODE=monitor to log pre-tool-use decisions without enforcing them.
 """
 
 from __future__ import annotations
@@ -15,7 +16,10 @@ import json
 import sys
 from typing import Any, Optional
 
-from . import ledger
+import os
+import time
+
+from . import indicators, ledger, policy
 from .labels import Label, SourceType, digest, source_for_tool, trust_for
 from .scan import scan_text
 
@@ -54,17 +58,19 @@ def label_tool_result(event: dict) -> Optional[Label]:
     text = _flatten(event.get("tool_response"))
     source = source_for_tool(tool_name)
     flags, hints = scan_text(text)
+    trust = trust_for(source)
     return Label(
         session_id=session_id,
         turn=ledger.next_turn(session_id, cwd),
         source_type=source.value,
-        trust=trust_for(source).value,
+        trust=trust.value,
         origin=_origin(tool_name, event.get("tool_input")),
         tool_name=tool_name,
         chars=len(text),
         sha256=digest(text),
         flags=flags,
         hints=hints,
+        indicators=indicators.extract(text) if trust.value == "untrusted" else {},
     )
 
 
@@ -109,6 +115,29 @@ def _emit(event_name: str, note: str) -> None:
         json.dump({"hookSpecificOutput": {"hookEventName": event_name, "additionalContext": note}}, sys.stdout)
 
 
+def decide_tool_call(event: dict) -> policy.Decision:
+    session_id = str(event.get("session_id", "unknown"))
+    cwd = event.get("cwd")
+    rows = ledger.read_all(session_id, cwd)
+    pol = policy.load_policy(cwd)
+    return policy.decide(str(event.get("tool_name", "")), event.get("tool_input"), rows, pol)
+
+
+def _emit_decision(decision: policy.Decision) -> None:
+    # Only speak up for ask/deny. Emitting "allow" would skip Claude Code's own permission checks.
+    if decision.action in (policy.ASK, policy.DENY):
+        json.dump(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": decision.action,
+                    "permissionDecisionReason": decision.reason,
+                }
+            },
+            sys.stdout,
+        )
+
+
 def _read_event() -> dict:
     raw = sys.stdin.read()
     return json.loads(raw) if raw.strip() else {}
@@ -128,6 +157,26 @@ def main(argv: Optional[list] = None) -> int:
             label = label_user_prompt(event)
             ledger.append(label, event.get("cwd"))
             _emit("UserPromptSubmit", build_note(label))
+        elif cmd == "pre-tool-use":
+            event = _read_event()
+            decision = decide_tool_call(event)
+            mode = os.environ.get("LLM_BOUNCER_MODE", "enforce")
+            if decision.action != policy.ALLOW or decision.risk:
+                ledger.append_decision(
+                    str(event.get("session_id", "unknown")),
+                    {
+                        "ts": time.time(),
+                        "mode": mode,
+                        "tool_name": event.get("tool_name"),
+                        "action": decision.action,
+                        "risk": decision.risk,
+                        "echoes": decision.echoes,
+                        "reason": decision.reason,
+                    },
+                    event.get("cwd"),
+                )
+            if mode != "monitor":
+                _emit_decision(decision)
         elif cmd == "show":
             sid = args[1] if len(args) > 1 else ""
             for row in ledger.read_all(sid):
