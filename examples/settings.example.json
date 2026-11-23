@@ -5,6 +5,9 @@
     ],
     "PostToolUse": [
       { "matcher": "*", "hooks": [ { "type": "command", "command": "llm-bouncer post-tool-use" } ] }
+    ],
+    "PreToolUse": [
+      { "matcher": "*", "hooks": [ { "type": "command", "command": "llm-bouncer pre-tool-use" } ] }
     ]
   }
 }

@@ -51,3 +51,12 @@ def read_all(session_id: str, cwd: str | None = None) -> List[dict]:
 
 def next_turn(session_id: str, cwd: str | None = None) -> int:
     return len(read_all(session_id, cwd)) + 1
+
+
+def append_decision(session_id: str, record: dict, cwd: str | None = None) -> Path:
+    """Decisions go to a separate file so the label ledger stays one-row-per-text."""
+    path = ledger_dir(cwd) / f"{_safe(session_id)}.decisions.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return path

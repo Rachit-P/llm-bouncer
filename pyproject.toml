@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "llm-bouncer"
-version = "0.0.1"
+version = "0.1.0"
 description = "Text labelling for LLM agents: records where every piece of text an agent reads came from."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
-dependencies = []
+dependencies = ["pyyaml>=6"]
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]
@@ -19,6 +19,9 @@ llm-bouncer = "llm_bouncer.hooks:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+llm_bouncer = ["policies/*.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
