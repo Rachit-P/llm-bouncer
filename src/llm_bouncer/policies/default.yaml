@@ -1,9 +1,14 @@
-# llm-bouncer default policy (v1). Copy to .llm-bouncer/policy.yaml in your project to customise,
-# or point LLM_BOUNCER_POLICY at your own file.
+# llm-bouncer default policy. To customise, put only the keys you want to change in
+# ~/.llm-bouncer/policy.yaml (or a file named by LLM_BOUNCER_POLICY). Top-level keys you set
+# replace the default ones; keys you leave out keep their defaults.
+# A policy file inside the project is ignored on purpose: a cloned repo could switch the gate off.
 
 # Which labelled sources count as "tainted" for the ask rule.
 # file and command output can also carry attacker text; add them for a stricter mode.
 taint_sources: [web, mcp, tool, user_pasted]
+
+# Risk categories that always ask, even in a session that read nothing untrusted.
+always_ask_risks: [bouncer_tamper]
 
 # What to do when a risky action echoes a URL, email or command that appeared in tainted text.
 on_echo: deny        # deny | ask
@@ -13,37 +18,55 @@ on_risky_after_taint: ask   # ask | deny | allow
 # Risky Bash commands, by category (Python regex, case-insensitive).
 bash_risky:
   download_and_execute:
-    - '(curl|wget)\b[^|;&]*\|\s*(sudo\s+)?(ba|z)?sh\b'
-    - 'bash\s+<\('
+    - '(curl|wget|fetch)\b[^;&]*\|\s*(sudo\s+(-\S+\s+)*)?(\S*/)?((ba|z|da|k|fi)?sh|python3?|perl|ruby|node)\b'
+    - '\b((ba|z)?sh|source|\.)\s+<\('
     - '\b(python3?|node|perl|ruby)\s+-[ce]\b'
-    - '\beval\b'
-    - 'base64\s+(-d|--decode)'
+    - '\beval\s+["''$(`]'
+    - 'base64\b[^|;&]*\s-(d|D|-decode)\b'
+    - '\b(curl|wget)\b[^;&|]*&&\s*(ba|z)?sh\b'
   send_data_out:
-    - 'curl\b.*\s(-d|--data\S*|-F|--form|-T|--upload-file)\b'
+    - 'curl\b.*\s(-[a-zA-Z]*[dFT]|--data\S*|--form\S*|--upload-file|--json)'
+    - 'curl\b.*\s(-X|--request)\s*(POST|PUT|PATCH)'
     - 'wget\b.*--post'
     - '\b(nc|ncat|netcat|scp|sftp|rsync)\b'
   secrets:
     - '(\.env\b|id_rsa|id_ed25519|\.ssh/|\.aws/credentials|\.npmrc|\.netrc|\.git-credentials|\.pypirc)'
     - '\b(printenv|env)\b\s*($|\|)'
+    - '\$\{?[A-Z0-9_]*(TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|PRIVATE_KEY)\b'
   publish:
-    - '\bgit\s+push\b'
-    - '\bnpm\s+publish\b'
+    - '\bgit\b[^|;&\n]*\spush\b'
+    - '\b(npm|pnpm|yarn)\b[^|;&\n]*\spublish\b'
     - '\btwine\s+upload\b'
-    - '\bgh\s+(pr|release|repo|gist)\s+create\b'
+    - '\bgh\s+(pr|release|repo|gist|issue)\s+(create|comment|edit|merge)\b'
+    - '\bgh\s+api\b.*\s(-X|--method)\s*(POST|PUT|PATCH|DELETE)\b'
+    - '\bgh\s+api\b.*\s(-f|-F|--field|--raw-field|--input)\b'
   destructive:
-    - '\brm\s+-[a-z]*r[a-z]*f?\s+(/|~|\$HOME)'
+    - '\brm\b(?=[^|;&\n]*\s(-[a-zA-Z]*[rR]|--recursive))[^|;&\n]*\s(/|~/?|\$HOME/?|\*|\.\.?/?)(\s|$|\*)'
     - '\bchmod\s+(-R\s+)?777\b'
     - '\bsudo\b'
 
 # Writing or editing these paths is risky (agent config, CI, shell startup, secrets).
+# Also checked for Bash commands that write (>, >>, tee, cp, mv, sed -i, ...).
 sensitive_paths:
   - '(^|/)\.env(\.|$)'
   - '(^|/)\.claude/'
+  - '(^|/)\.claude\.json$'
+  - '(^|/)\.mcp\.json$'
+  - '(^|/)(CLAUDE|AGENTS)\.md$'
   - '(^|/)\.github/workflows/'
-  - '(^|/)\.git/hooks/'
-  - '(^|/)\.(bashrc|zshrc|profile|bash_profile)$'
+  - '(^|/)\.gitlab-ci\.yml$'
+  - '(^|/)\.circleci/'
+  - '(^|/)\.git/(hooks/|config$)'
+  - '(^|/)\.vscode/(settings|tasks)\.json$'
+  - '(^|/)\.(bashrc|zshrc|profile|bash_profile|zprofile|zshenv)$'
   - '(^|/)\.ssh/'
   - '(^|/)\.aws/'
+
+# llm-bouncer's own ledger and policy. Touching them asks every time (see always_ask_risks).
+bouncer_paths:
+  - '\.llm-bouncer\b'
+  - '\bLLM_BOUNCER_'
+  - '\bllm-bouncer\b.*\buninstall\b'
 
 # Reading these paths is risky (secrets the agent could then send out).
 secret_paths:
@@ -52,8 +75,10 @@ secret_paths:
   - '(^|/)\.aws/credentials$'
   - '(^|/)\.(npmrc|netrc|pypirc|git-credentials)$'
 
-# MCP tool names that act on the outside world.
-mcp_risky_name: '(send|post|create|delete|remove|update|write|push|merge|email|message|comment|publish|transfer|pay)'
+# MCP tools: a name is split into words (send_email, sendEmail -> send, email).
+# It is risky if it contains a risky verb and does not START with a read-only verb.
+mcp_readonly_verbs: [get, list, read, search, fetch, query, find, view, describe, show, lookup, retrieve, count, check, download]
+mcp_risky_verbs: [send, post, create, delete, remove, update, write, push, merge, email, reply, forward, comment, publish, transfer, pay, share, invite, upload, execute, run, trigger, approve, close, archive, move, edit, set, add, assign, deploy]
 
-# A fetched URL with a very long query string may be smuggling data out.
+# A fetched URL with a very long query string, query value or path segment may be smuggling data out.
 max_fetch_query_chars: 120

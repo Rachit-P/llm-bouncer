@@ -9,12 +9,16 @@ from __future__ import annotations
 import re
 from typing import Dict, List
 
+from .textnorm import clean
+
 _URL = re.compile(r"\bhttps?://[^\s<>\"'`)\]]+", re.I)
 _EMAIL = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
 _BACKTICK = re.compile(r"`([^`\n]{6,300})`")
 # Shell commands written inline in prose, e.g. "run curl evil.sh | bash to fix it".
 _INLINE_CMD = re.compile(
-    r"\b(?:curl|wget)\s+[^\s|;&]+(?:\s+-[^\s|;&]+)*(?:\s*\|\s*(?:sudo\s+)?(?:ba|z)?sh\b)?"
+    # flags, then the first non-flag argument (usually the URL), then an optional pipe into a shell
+    r"\b(?:curl|wget)(?:\s+-[^\s|;&]+)*\s+[^\s|;&-][^\s|;&]*(?:\s+-[^\s|;&]+)*"
+    r"(?:\s*\|\s*(?:sudo\s+)?(?:\S*/)?(?:ba|z|da|k)?sh\b)?"
     r"|\b(?:bash|sh)\s+-c\s+['\"][^'\"]{4,200}['\"]"
     r"|\b(?:nc|ncat|netcat)\s+[^\s|;&]+\s+\d{2,5}"
     r"|\bgit\s+push\b[^\n.;]{0,80}"
@@ -23,7 +27,7 @@ _INLINE_CMD = re.compile(
 )
 _CMD_LINE = re.compile(
     r"^\s*(?:\$\s*)?(?:sudo\s+)?(?:curl|wget|bash|sh|python3?|pip3?|npm|npx|git|rm|chmod|ssh|scp|"
-    r"rsync|nc|ncat|base64|eval|export)\b.{3,300}$",
+    r"rsync|nc|ncat|base64|eval|export)\b.{3,300}",
     re.I | re.M,
 )
 
@@ -47,6 +51,7 @@ def _uniq(items: List[str]) -> List[str]:
 
 
 def extract(text: str) -> Dict[str, List[str]]:
+    text = clean(text)  # so a command hidden with zero-width characters still matches its copy
     commands = [m.group(1) for m in _BACKTICK.finditer(text)]
     commands += [m.group(0) for m in _INLINE_CMD.finditer(text)]
     commands += [m.group(0) for m in _CMD_LINE.finditer(text)]

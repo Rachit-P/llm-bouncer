@@ -12,13 +12,23 @@ from typing import List, Tuple
 
 # Zero-width / bidi-control characters often used to hide text.
 _ZERO_WIDTH = {"​", "‌", "‍", "⁠", "﻿", "­"}
-_BIDI = {chr(c) for c in range(0x202A, 0x202F)} | {chr(c) for c in range(0x2066, 0x206A)}
-_HTML_COMMENT = re.compile(r"<!--(.*?)-->", re.S)
+_BIDI = (
+    {chr(c) for c in range(0x202A, 0x202F)}
+    | {chr(c) for c in range(0x2066, 0x206A)}
+    | {"\u200e", "\u200f", "\u061c"}
+)
 _HIDDEN_STYLE = re.compile(
-    r"(display\s*:\s*none|visibility\s*:\s*hidden|font-size\s*:\s*0|opacity\s*:\s*0(?:\.0+)?\b"
-    r"|color\s*:\s*#?fff(?:fff)?\b|aria-hidden\s*=\s*[\"']true[\"'])",
+    r"(display\s*:\s*none|visibility\s*:\s*hidden|font-size\s*:\s*0(?![.\d])|opacity\s*:\s*0(?:\.0+)?(?![.\d])"
+    r"|(?<![-\w])color\s*:\s*(?:#fff(?:fff)?|white)\b|aria-hidden\s*=\s*[\"']true[\"'])",
     re.I,
 )
+
+
+def _has_html_comment(text: str) -> bool:
+    # str.find is linear; the old regex <!--(.*?)--> was quadratic on many unclosed "<!--",
+    # which let a page stall the hook past its timeout so the read was never recorded.
+    start = text.find("<!--")
+    return start != -1 and text.find("-->", start + 4) != -1
 
 # Phrases aimed at the AI itself.
 _AI_ADDRESSED = re.compile(
@@ -55,7 +65,7 @@ def find_hidden(text: str) -> List[str]:
         flags.append("unicode_tags")
     if any(unicodedata.category(ch) == "Co" for ch in text):
         flags.append("private_use_chars")
-    if _HTML_COMMENT.search(text):
+    if _has_html_comment(text):
         flags.append("html_comment")
     if _HIDDEN_STYLE.search(text):
         flags.append("hidden_style")

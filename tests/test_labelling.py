@@ -46,7 +46,8 @@ def test_post_tool_use_writes_label_and_note(tmp_path, monkeypatch):
     assert rows[0]["origin"] == "https://docs.example.com"
     assert rows[0]["turn"] == 1
     note = hooks.build_note(label)
-    assert "UNTRUSTED" in note and "Instruction-like" in note
+    assert "UNTRUSTED" in note and "instruction-like" in note
+    assert "curl" not in note  # untrusted text is never quoted back to the model
 
 
 def test_user_prompt_is_trusted_and_quiet(tmp_path, monkeypatch):

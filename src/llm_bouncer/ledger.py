@@ -12,10 +12,16 @@ from .labels import Label
 
 
 def ledger_dir(cwd: str | None = None) -> Path:
+    """Where ledgers live. Keyed by session only, never by the working directory.
+
+    Earlier versions used <cwd>/.llm-bouncer, which lost the session's history as soon as the
+    agent changed directory, and put the ledger inside the repo where the agent could edit it
+    or commit it. `cwd` is accepted for backwards compatibility and ignored.
+    """
     override = os.environ.get("LLM_BOUNCER_DIR")
     if override:
         return Path(override)
-    return Path(cwd or os.getcwd()) / ".llm-bouncer"
+    return Path.home() / ".llm-bouncer" / "sessions"
 
 
 def _safe(session_id: str) -> str:
