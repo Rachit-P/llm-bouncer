@@ -54,17 +54,26 @@ _SENSITIVE = re.compile(
 _SENTENCE = re.compile(r"(?:[^\n]*?(?:[.!?](?=\s|$)|(?=\n)|$))")
 
 
+_ZERO_WIDTH_RE = re.compile("[" + "".join(sorted(_ZERO_WIDTH)) + "]")
+_BIDI_RE = re.compile("[" + "".join(sorted(_BIDI)) + "]")
+_TAGS_RE = re.compile("[\U000e0000-\U000e007f]")
+_PRIVATE_USE_RE = re.compile("[\ue000-\uf8ff\U000f0000-\U000ffffd\U00100000-\U0010fffd]")
+
+
 def find_hidden(text: str) -> List[str]:
+    # One C-speed regex search per check instead of Python loops over every character
+    # (a 1 MB command output took ~0.3 s before, ~5 ms now).
     flags: List[str] = []
-    if any(ch in _ZERO_WIDTH for ch in text):
-        flags.append("zero_width_chars")
-    if any(ch in _BIDI for ch in text):
-        flags.append("bidi_controls")
-    # Unicode "tag" characters (U+E0000-E007F) can smuggle invisible ASCII.
-    if any(0xE0000 <= ord(ch) <= 0xE007F for ch in text):
-        flags.append("unicode_tags")
-    if any(unicodedata.category(ch) == "Co" for ch in text):
-        flags.append("private_use_chars")
+    if not text.isascii():
+        if _ZERO_WIDTH_RE.search(text):
+            flags.append("zero_width_chars")
+        if _BIDI_RE.search(text):
+            flags.append("bidi_controls")
+        # Unicode "tag" characters (U+E0000-E007F) can smuggle invisible ASCII.
+        if _TAGS_RE.search(text):
+            flags.append("unicode_tags")
+        if _PRIVATE_USE_RE.search(text):
+            flags.append("private_use_chars")
     if _has_html_comment(text):
         flags.append("html_comment")
     if _HIDDEN_STYLE.search(text):
@@ -72,10 +81,18 @@ def find_hidden(text: str) -> List[str]:
     return flags
 
 
+HINT_SCAN_CHARS = 200_000
+
+
 def find_hints(text: str, max_hints: int = 5) -> List[dict]:
-    """Return up to max_hints instruction-like sentences. Heuristic; may be wrong either way."""
+    """Return up to max_hints instruction-like sentences. Heuristic; may be wrong either way.
+
+    Only the first HINT_SCAN_CHARS are scanned: hints are advisory, and nothing is decided on them.
+    """
     hints: List[dict] = []
-    for m in _SENTENCE.finditer(text):
+    if not (_AI_ADDRESSED.search(text, 0, HINT_SCAN_CHARS) or _ACTION_VERB.search(text, 0, HINT_SCAN_CHARS)):
+        return hints  # cheap pre-check: no sentence can match
+    for m in _SENTENCE.finditer(text, 0, HINT_SCAN_CHARS):
         sent = m.group(0).strip()
         if len(sent) < 8:
             continue
@@ -91,6 +108,6 @@ def find_hints(text: str, max_hints: int = 5) -> List[dict]:
     return hints
 
 
-def scan_text(text: str) -> Tuple[List[str], List[dict]]:
-    """Return (flags, hints) for a piece of text."""
-    return find_hidden(text), find_hints(text)
+def scan_text(text: str, hints: bool = True) -> Tuple[List[str], List[dict]]:
+    """Return (flags, hints) for a piece of text. hints=False skips the heuristic pass."""
+    return find_hidden(text), (find_hints(text) if hints else [])

@@ -59,8 +59,7 @@ def run_case(case: Dict[str, Any], workdir: str) -> policy.Decision:
                     "tool_response": {"output": step.get("output", "")},
                 }
             )
-        if label is not None:
-            ledger.append(label, workdir)
+        ledger.record(label)
     action = case["action"]
     return hooks.decide_tool_call(
         {"session_id": session_id, "cwd": workdir, "tool_name": action["tool"], "tool_input": action.get("input", {})}
@@ -71,10 +70,9 @@ def run(path: Optional[str] = None, policy_path: Optional[str] = None) -> Dict[s
     saved = {k: os.environ.get(k) for k in ("LLM_BOUNCER_DIR", "LLM_BOUNCER_POLICY")}
     results = []
     try:
-        if policy_path:
-            os.environ["LLM_BOUNCER_POLICY"] = str(Path(policy_path).resolve())
-        else:
-            os.environ.pop("LLM_BOUNCER_POLICY", None)
+        # Without --policy, score the built-in rules: a personal ~/.llm-bouncer/policy.yaml
+        # must not change the published numbers or make `eval --check` fail in CI.
+        os.environ["LLM_BOUNCER_POLICY"] = str(Path(policy_path).resolve()) if policy_path else policy.BUILTIN
         policy._load.cache_clear()
         for case in load_cases(path):
             with tempfile.TemporaryDirectory() as tmp:
