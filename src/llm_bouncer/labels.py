@@ -16,7 +16,8 @@ class SourceType(str, Enum):
     FILE = "file"  # Read / Grep / Glob results
     COMMAND = "command"  # Bash / shell output
     MCP = "mcp"  # any MCP tool result
-    TOOL = "tool"  # any other tool result
+    TOOL = "tool"  # any other tool result (subagents, unknown tools)
+    INTERNAL = "internal"  # the agent's own bookkeeping (todo lists, plan mode); never taints
 
 
 class Trust(str, Enum):
@@ -33,6 +34,7 @@ _TRUST = {
     SourceType.COMMAND: Trust.UNTRUSTED,
     SourceType.MCP: Trust.UNTRUSTED,
     SourceType.TOOL: Trust.UNTRUSTED,
+    SourceType.INTERNAL: Trust.UNTRUSTED,
 }
 
 _TOOL_SOURCE = {
@@ -42,7 +44,18 @@ _TOOL_SOURCE = {
     "Grep": SourceType.FILE,
     "Glob": SourceType.FILE,
     "NotebookRead": SourceType.FILE,
+    # Edit/Write results echo file contents back, so they are file text, not an unknown tool.
+    "Write": SourceType.FILE,
+    "Edit": SourceType.FILE,
+    "MultiEdit": SourceType.FILE,
+    "NotebookEdit": SourceType.FILE,
+    "LS": SourceType.FILE,
     "Bash": SourceType.COMMAND,
+    "BashOutput": SourceType.COMMAND,
+    "TodoWrite": SourceType.INTERNAL,
+    "ExitPlanMode": SourceType.INTERNAL,
+    "KillShell": SourceType.INTERNAL,
+    "KillBash": SourceType.INTERNAL,
 }
 
 

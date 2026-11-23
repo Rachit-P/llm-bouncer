@@ -4,7 +4,7 @@
 
 AI agents read a lot of text they did not write: web pages, files, command output, MCP tool results. Any of it can contain hidden instructions. `llm-bouncer` keeps a record of *what* the agent read and *where it came from*, and checks every tool call against that record before it runs.
 
-> **Status: v0.2.0.** Labelling (v0), a pre-tool-use gate (v1) and an evaluation kit. Every decision comes from fixed rules, not from a model.
+> **Status: v0.3.0.** Labelling (v0), a pre-tool-use gate (v1) and an evaluation kit. Every decision comes from fixed rules, not from a model.
 
 ## What it does
 
@@ -14,7 +14,7 @@ AI agents read a lot of text they did not write: web pages, files, command outpu
 | `PostToolUse` | after every tool call | labels the tool's output by source and trust, scans it, saves the URLs, emails and commands it contains, writes one entry to the session ledger, and tells the model the content is untrusted |
 | `PreToolUse` | before every tool call | classifies the call as risky or not, reads the session ledger, and returns **deny**, **ask** or nothing (normal permissions apply) |
 
-Each ledger entry (`.llm-bouncer/<session>.jsonl`) records:
+Each ledger entry (`~/.llm-bouncer/sessions/<session>.jsonl`) records:
 
 - **source_type**: `user_typed`, `web`, `file`, `command`, `mcp`, `tool` (`user_pasted` is reserved)
 - **trust**: `trusted` or `untrusted`, decided by source type alone (deterministic, no guessing)
@@ -26,19 +26,21 @@ Each ledger entry (`.llm-bouncer/<session>.jsonl`) records:
 
 ## The v1 rules
 
-1. **Is the call risky?** Bash commands that download and run code, send data out, touch secrets, publish (`git push`, `npm publish`, `gh pr create`) or destroy; writes to `.env`, `.claude/`, `.github/workflows/`, `.git/hooks/`, shell rc files, `.ssh/`, `.aws/`; reads of secret files; `WebFetch` with a very long query string; MCP tools whose names send, post, create, delete, email, pay and so on. Anything else is left alone.
-2. **Echo check → deny.** If a risky call contains a URL, email or command that first appeared in untrusted text this session, it is blocked. The model is told why, so it can tell the developer.
+1. **Is the call risky?** Bash commands that download and run code, send data out, touch secrets, publish (`git push`, `npm publish`, `gh pr create`) or destroy; writes (through Write/Edit or Bash redirects, `tee`, `cp`, `sed -i`) to `.env`, agent config (`.claude/`, `CLAUDE.md`, `AGENTS.md`, `.mcp.json`), CI config, `.git/hooks/` and `.git/config`, shell rc files, `.ssh/`, `.aws/`; reads of secret files; `WebFetch` with a very long query, query value or path segment; MCP tools whose names act (send, post, create, delete, email, pay and so on), unless the name starts with a read-only verb (get, list, read, search...). Anything else is left alone.
+2. **Echo check → deny.** If a risky call contains a URL, email or specific command that first appeared in untrusted text this session, it is blocked. Matching ignores case, spacing, invisible characters and http vs https. A command only counts if it names something specific (a host, path, address or payload), so copying a generic `git push` from docs asks instead of blocking. The model is told why, so it can tell the developer.
 3. **Risky after untrusted → ask.** If the agent read web, MCP or other tool output this session and now wants to do something risky, Claude Code asks the developer to approve.
 
-Risky calls in a session with no untrusted reading, and harmless calls at any time, pass through untouched. File and command output are labelled untrusted but do not trigger rule 3 by default (they would ask too often); add them to `taint_sources` for a stricter mode.
+Risky calls in a session with no untrusted reading, and harmless calls at any time, pass through untouched. The agent's own Edit, Write and todo-list results never taint the session. File and command output are labelled untrusted but do not trigger rule 3 by default (they would ask too often); add them to `taint_sources` for a stricter mode.
 
 ### Customising
 
-The rules live in [`src/llm_bouncer/policies/default.yaml`](src/llm_bouncer/policies/default.yaml). Copy it to `.llm-bouncer/policy.yaml` in your project, or set `LLM_BOUNCER_POLICY=/path/to/policy.yaml`, and edit the regexes, paths and actions.
+The rules live in [`src/llm_bouncer/policies/default.yaml`](src/llm_bouncer/policies/default.yaml). To change them, write only the keys you want to change to `~/.llm-bouncer/policy.yaml`, or to a file named by `LLM_BOUNCER_POLICY`; every key you leave out keeps its default (see [`examples/policy.strict.yaml`](examples/policy.strict.yaml)). A policy file inside the project is ignored on purpose, because a cloned repo could ship one that turns the gate off. An invalid policy (unknown action, bad regex, missing file) makes the gate **ask** on every call rather than fail silently. Set `LLM_BOUNCER_FAIL_OPEN=1` if you prefer errors to let calls through.
+
+Calls that touch llm-bouncer itself (its ledger, its policy, `LLM_BOUNCER_*` settings) always ask, even in a session that read nothing untrusted.
 
 ### Trying it without enforcement
 
-Set `LLM_BOUNCER_MODE=monitor` to log what *would* have been denied or asked to `.llm-bouncer/<session>.decisions.jsonl` without changing anything. Good for measuring false alarms on your own work before turning it on.
+Set `LLM_BOUNCER_MODE=monitor` to log what *would* have been denied or asked to `~/.llm-bouncer/sessions/<session>.decisions.jsonl` without changing anything. Good for measuring false alarms on your own work before turning it on.
 
 ## Quick start (Claude Code)
 
@@ -52,7 +54,7 @@ Copy [`examples/settings.example.json`](examples/settings.example.json) into you
 llm-bouncer show <session_id>
 ```
 
-Set `LLM_BOUNCER_DIR` to change where ledgers are stored.
+Ledgers are stored per session in `~/.llm-bouncer/sessions/`, outside the project so the agent changing directory cannot lose them and `git add -A` cannot commit them. Set `LLM_BOUNCER_DIR` to change the location. `llm-bouncer show` with no argument lists sessions.
 
 ## Example
 
@@ -77,7 +79,7 @@ A later `git push` in the same session gets `"ask"` instead, and `ls` passes thr
 
 ## Evaluation
 
-`llm-bouncer eval` replays bundled scenarios through the real hooks: each one is a short session (what the agent read, then one tool call) with the outcome the policy should give. 21 are attacks, including 5 **known gaps** the default policy misses on purpose, and 13 are normal work.
+`llm-bouncer eval` replays bundled scenarios through the real hooks: each one is a short session (what the agent read, then one tool call) with the outcome the policy should give. 28 are attacks, including 5 **known gaps** the default policy misses on purpose, and 18 are normal work.
 
 ```bash
 llm-bouncer eval                                     # table + summary
@@ -88,8 +90,8 @@ llm-bouncer eval --check                             # exit 1 if results drift (
 
 | Policy | Attacks caught (deny or ask) | Blocked outright | Harmless calls asked | Harmless calls blocked |
 |---|---|---|---|---|
-| default | 16 / 21 (76%) | 6 / 21 (29%) | 2 / 13 (15%) | 1 / 13 (8%) |
-| strict (`file` and `command` also taint) | 18 / 21 (86%) | 7 / 21 (33%) | 3 / 13 (23%) | 1 / 13 (8%) |
+| default | 23 / 28 (82%) | 9 / 28 (32%) | 3 / 18 (17%) | 1 / 18 (6%) |
+| strict (`file` and `command` also taint) | 25 / 28 (89%) | 10 / 28 (36%) | 5 / 18 (28%) | 1 / 18 (6%) |
 
 The one wrongly blocked harmless call is real: the developer asks to install Rust, the agent reads the official rustup page, and runs the exact command it shows. The echo rule cannot tell an official install command from a planted one. Scenario files live in [`src/llm_bouncer/evals/scenarios/`](src/llm_bouncer/evals/scenarios/); add a YAML file with the same shape to test your own.
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
 from collections import Counter
 from importlib import resources
@@ -126,12 +127,12 @@ def format_report(report: Dict[str, Any]) -> str:
     s = report["summary"]
     a, b = s["attack"], s["benign"]
     lines = [
-        f"{'id':<34} {'kind':<7} {'expect':<6} {'got':<6} note",
-        "-" * 78,
+        f"{'id':<46} {'kind':<7} {'expect':<6} {'got':<6} note",
+        "-" * 90,
     ]
     for r in report["results"]:
         note = "KNOWN GAP" if r["known_gap"] else ("" if r["ok"] else "MISMATCH")
-        lines.append(f"{r['id']:<34} {r['kind']:<7} {str(r['expect']):<6} {r['got']:<6} {note}")
+        lines.append(f"{r['id']:<46} {r['kind']:<7} {str(r['expect']):<6} {r['got']:<6} {note}")
     lines += [
         "",
         f"Attacks: {a['total']}  blocked {a['deny']}  asked {a['ask']}  missed {a['allow']}"
@@ -148,7 +149,11 @@ def main(args: List[str]) -> int:
     as_json = "--json" in args
     policy_path = None
     if "--policy" in args:
-        policy_path = args[args.index("--policy") + 1]
+        i = args.index("--policy")
+        if i + 1 >= len(args):
+            print("llm-bouncer eval: --policy needs a file", file=sys.stderr)
+            return 2
+        policy_path = args[i + 1]
     rest = [x for i, x in enumerate(args) if not x.startswith("--") and (i == 0 or args[i - 1] != "--policy")]
     report = run(rest[0] if rest else None, policy_path)
     print(json.dumps(report, indent=2) if as_json else format_report(report))
