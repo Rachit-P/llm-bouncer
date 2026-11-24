@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 from urllib.parse import parse_qsl, urlparse
 
-from .textnorm import norm, one_line
+from .textnorm import key_hash, norm, one_line, url_keys
 
 ALLOW, ASK, DENY = "allow", "ask", "deny"
 _ACTIONS = (ALLOW, ASK, DENY)
@@ -94,12 +94,15 @@ def _parse(path: Optional[str]) -> Dict[str, Any]:
 
 
 def _cache_key(path: Optional[str]) -> str:
-    parts = []
+    # Content hash, not mtime: an edit within the same timestamp tick, or a file restored with
+    # its old mtime, must not serve a stale policy. Both files are a few KB, so this is cheap.
+    import hashlib
+
+    h = hashlib.sha256()
     for f in (str(_DEFAULT_PATH), path):
         if f:
-            st = os.stat(f)  # a missing user policy raises here -> fail closed
-            parts.append(f"{f}:{st.st_mtime_ns}:{st.st_size}")
-    return "|".join(parts)
+            h.update(f.encode() + b"\0" + Path(f).read_bytes() + b"\0")  # missing user policy -> fail closed
+    return h.hexdigest()
 
 
 @lru_cache(maxsize=8)
@@ -107,7 +110,7 @@ def _load(path: Optional[str]) -> Dict[str, Any]:
     """Parsed, merged, validated policy, cached as JSON next to the ledgers.
 
     Every hook is a fresh process, so without this each tool call imported PyYAML and parsed
-    and validated the policy again. The cache is keyed on the files' mtime and size.
+    and validated the policy again. The cache is keyed on a hash of the files' contents.
     """
     key = _cache_key(path)
     from .ledger import ledger_dir
@@ -236,34 +239,62 @@ def _distinctive(indicator: str) -> bool:
     return False
 
 
-def _url_key(url: str) -> str:
-    u = norm(url)
-    u = re.sub(r"^[a-z][a-z0-9+.-]*://", "", u)  # http and https are the same destination
-    return u.rstrip("/.,;:")
+
+
+_HOST_CHARS = set("abcdefghijklmnopqrstuvwxyz0123456789.-_@")
+_URL_CHARS = _HOST_CHARS | set("/~%+=:")
+
+
+def _occurs(key: str, haystack: str) -> bool:
+    """`key` appears in `haystack` as a whole item, not as part of a longer host, path or address.
+
+    Plain substring matching let "github.com" from a docs page match a push to
+    "github.com/me/repo", and "example.com" match "notexample.com". A query string or fragment
+    after a URL ("?", "#") still counts as the same URL.
+    """
+    start = haystack.find(key)
+    while start != -1:
+        end = start + len(key)
+        before = haystack[start - 1] if start else ""
+        after = haystack[end] if end < len(haystack) else ""
+        if (not before or before not in _HOST_CHARS) and (not after or after not in _URL_CHARS):
+            return True
+        start = haystack.find(key, start + 1)
+    return False
 
 
 def find_echoes(tool_input: Any, tainted: List[dict]) -> List[str]:
     """Indicators from tainted text that reappear in this tool call.
 
-    `tainted` is a list of ledger rows or state source summaries: anything with indicator lists
-    under "commands", "urls" and "emails" (rows nest them under "indicators").
+    `tainted` holds state source summaries (see ledger). Ledger rows are accepted too.
+    * URLs and emails: every one in the call is looked up, exactly, in the hashed set of those
+      seen in tainted text. Exact lookup has no cap to flood and no substring confusion.
+    * Commands: a specific command from tainted text must appear in the call as a whole.
     """
-    haystack = norm("\n".join(_strings(tool_input)))
+    from . import indicators
+    from .ledger import state_from_rows
+
+    if any("indicators" in t for t in tainted):
+        tainted = list(state_from_rows([t for t in tainted if "indicators" in t])["sources"].values())
+    raw = "\n".join(_strings(tool_input))
+    haystack = norm(raw)
+    found = indicators.extract(raw)
+    url_h = set().union(*(t.get("url_h", []) for t in tainted)) if tainted else set()
+    email_h = set().union(*(t.get("email_h", []) for t in tainted)) if tainted else set()
     hits: List[str] = []
-    for row in tainted:
-        ind = row.get("indicators") or row
-        for kind in ("commands", "urls", "emails"):
-            for item in ind.get(kind, []):
-                if kind == "commands":
-                    if not _distinctive(item):
-                        continue
-                    key = norm(item)
-                elif kind == "urls":
-                    key = _url_key(item)
-                else:
-                    key = norm(item)
-                if len(key) >= 6 and key in haystack and item not in hits:
-                    hits.append(item)
+    for url in found.get("urls", []):
+        if any(key_hash(k) in url_h for k in url_keys(url)) and url not in hits:
+            hits.append(url)
+    for email in found.get("emails", []):
+        if key_hash(norm(email)) in email_h and email not in hits:
+            hits.append(email)
+    for t in tainted:
+        for item in t.get("commands", []):
+            if item in hits or not _distinctive(item):
+                continue
+            key = norm(item)
+            if len(key) >= 6 and _occurs(key, haystack):
+                hits.append(item)
     return hits
 
 

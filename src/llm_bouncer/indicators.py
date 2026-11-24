@@ -31,21 +31,25 @@ _CMD_LINE = re.compile(
     re.I | re.M,
 )
 
-MAX_PER_KIND = 25
+# Per text. Was 25 for every kind: a page that listed 25 decoy URLs or commands before the real
+# one pushed the real one out, turning the echo check's deny into an ask. URLs and emails are
+# stored as short hashes (see ledger), so they can afford a much higher cap than commands.
+MAX_PER_KIND = 2000
+MAX_ADDRESSES = 50_000
 
 
 def _tidy(s: str) -> str:
     return re.sub(r"\s+", " ", s.strip()).rstrip(".,;:")
 
 
-def _uniq(items: List[str]) -> List[str]:
+def _uniq(items: List[str], cap: int = MAX_PER_KIND) -> List[str]:
     seen, out = set(), []
     for it in items:
         it = _tidy(it)
         if len(it) >= 6 and it.lower() not in seen:
             seen.add(it.lower())
             out.append(it[:300])
-        if len(out) >= MAX_PER_KIND:
+        if len(out) >= cap:
             break
     return out
 
@@ -56,8 +60,8 @@ def extract(text: str) -> Dict[str, List[str]]:
     commands += [m.group(0) for m in _INLINE_CMD.finditer(text)]
     commands += [m.group(0) for m in _CMD_LINE.finditer(text)]
     found = {
-        "urls": _uniq(_URL.findall(text)),
-        "emails": _uniq(_EMAIL.findall(text)),
+        "urls": _uniq(_URL.findall(text), MAX_ADDRESSES),
+        "emails": _uniq(_EMAIL.findall(text), MAX_ADDRESSES),
         "commands": _uniq(commands),
     }
     return {k: v for k, v in found.items() if v}
