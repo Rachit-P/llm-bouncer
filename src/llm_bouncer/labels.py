@@ -17,6 +17,7 @@ class SourceType(str, Enum):
     MCP = "mcp"  # any MCP tool result
     TOOL = "tool"  # any other tool result (subagents, unknown tools)
     INTERNAL = "internal"  # the agent's own bookkeeping (todo lists, plan mode); never taints
+    UNKNOWN = "unknown"  # content that could not be labelled (crash, malformed input); always taints
 
 
 class Trust(str, Enum):
@@ -34,6 +35,7 @@ _TRUST = {
     SourceType.MCP: Trust.UNTRUSTED,
     SourceType.TOOL: Trust.UNTRUSTED,
     SourceType.INTERNAL: Trust.UNTRUSTED,
+    SourceType.UNKNOWN: Trust.UNTRUSTED,
 }
 
 _TOOL_SOURCE = {
