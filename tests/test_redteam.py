@@ -93,10 +93,9 @@ def test_denylist_mode_keeps_the_old_behaviour(tmp_path, monkeypatch):
 
 
 def test_labelling_crash_still_taints_the_session(capsys):
-    deep = "x"
-    for _ in range(5000):
-        deep = {"a": deep}
-    raw = json.dumps({"session_id": SID, "tool_name": "mcp__evil__get_doc", "tool_input": {}, "tool_response": {"structuredContent": deep}})
+    # Built as text: json.dumps itself cannot encode this depth on Python 3.11.
+    deep = '{"a":' * 5000 + '"x"' + "}" * 5000
+    raw = '{"session_id": "%s", "tool_name": "mcp__evil__get_doc", "tool_input": {}, "tool_response": {"structuredContent": %s}}' % (SID, deep)
     sys.stdin = io.StringIO(raw)
     try:
         assert hooks.main(["post-tool-use"]) == 0
