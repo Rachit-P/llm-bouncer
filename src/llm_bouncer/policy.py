@@ -67,11 +67,13 @@ def _validate(pol: Dict[str, Any]) -> Dict[str, Any]:
     for key in ("on_echo", "on_risky_after_taint"):
         if pol.get(key) not in _ACTIONS:
             raise PolicyError(f"{key} must be one of {_ACTIONS}, got {pol.get(key)!r}")
+    if pol.get("tainted_mode", "allowlist") not in ("allowlist", "denylist"):
+        raise PolicyError(f"tainted_mode must be allowlist or denylist, got {pol.get('tainted_mode')!r}")
     try:
         for patterns in (pol.get("bash_risky") or {}).values():
             for p in patterns or []:
                 re.compile(p)
-        for key in ("sensitive_paths", "secret_paths", "bouncer_paths"):
+        for key in ("sensitive_paths", "secret_paths", "bouncer_paths", "secret_patterns"):
             for p in pol.get(key) or []:
                 re.compile(p)
     except re.error as exc:
@@ -308,14 +310,116 @@ def decide(tool_name: str, tool_input: Any, ledger_rows: List[dict], policy: Dic
     return decide_from_state(tool_name, tool_input, state_from_rows(ledger_rows), policy)
 
 
+# ---------------------------------------------------------------- allowlist (tainted sessions)
+
+_SEPARATORS = {";", "&&", "||", "|", "&", "|&"}
+_SAFE_REDIRECTS = re.compile(r"\s\d?>&\d\b|\s(?:\d|&)?>\s*/dev/null\b")
+_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def bash_is_safe(command: str, policy: Dict[str, Any]) -> bool:
+    """Is every part of this command on the allowlist?
+
+    Deliberately strict: command substitution, process substitution, heredocs, redirections
+    (other than to /dev/null or between streams), subshells, env assignments and paths to
+    binaries all make the command "not safe", which only means the developer is asked.
+    """
+    import shlex
+
+    if any(t in command for t in ("$(", "`", "<(", ">(", "<<")):
+        return False
+    text = _SAFE_REDIRECTS.sub(" ", " " + command).replace("\n", " ; ")
+    try:
+        lex = shlex.shlex(text, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        tokens = list(lex)
+    except ValueError:  # unbalanced quotes
+        return False
+    safe = set(policy.get("bash_safe_commands") or [])
+    prefixes = [p.split() for p in policy.get("bash_safe_prefixes") or []]
+    unsafe_args = policy.get("bash_unsafe_args") or {}
+    segments: List[List[str]] = [[]]
+    for tok in tokens:
+        if tok in _SEPARATORS:
+            segments.append([])
+        elif tok and set(tok) <= set("<>&|;()"):
+            return False  # redirection or subshell
+        else:
+            segments[-1].append(tok)
+    segments = [seg for seg in segments if seg]
+    if not segments:
+        return False
+    for seg in segments:
+        first = seg[0]
+        if _ASSIGNMENT.match(first) or "/" in first:
+            return False  # VAR=x cmd (e.g. PAGER=...) or ./script, /tmp/x
+        if not (first in safe or any(seg[: len(p)] == p for p in prefixes)):
+            return False
+        bad = unsafe_args.get(first) or []
+        for arg in seg[1:]:
+            if arg in bad or any(arg.startswith(b + "=") for b in bad if b.startswith("--")):
+                return False
+            if first == "git" and arg.startswith("-c") and len(arg) > 2:
+                return False
+    return True
+
+
+def mcp_is_safe(tool_name: str, policy: Dict[str, Any]) -> bool:
+    tokens = _name_tokens(tool_name.split("__")[-1])
+    return bool(tokens) and tokens[0] in set(policy.get("mcp_readonly_verbs") or [])
+
+
+def _entropy(s: str) -> float:
+    import math
+    from collections import Counter
+
+    n = len(s)
+    return -sum(c / n * math.log2(c / n) for c in Counter(s).values()) if n else 0.0
+
+
+def looks_secret(text: str, policy: Dict[str, Any]) -> bool:
+    if _any(policy.get("secret_patterns"), text):
+        return True
+    limit = float(policy.get("min_secret_entropy", 3.5))
+    for tok in re.findall(r"[A-Za-z0-9+=_-]{20,}", text):  # split on "/" and ".": paths are not secrets
+        classes = sum(bool(re.search(p, tok)) for p in (r"[a-z]", r"[A-Z]", r"[0-9]", r"[+=_-]"))
+        if classes >= 3 and _entropy(tok) >= limit:
+            return True
+    return False
+
+
+def _unlisted(tool_name: str, tool_input: Any, policy: Dict[str, Any]) -> Optional[str]:
+    """Why a non-risky call still needs approval in a tainted session (None = it does not)."""
+    if policy.get("tainted_mode", "allowlist") != "allowlist":
+        return None
+    ti = tool_input if isinstance(tool_input, dict) else {}
+    if tool_name == "Bash" and not bash_is_safe(str(ti.get("command", "")), policy):
+        return "command_not_on_allowlist"
+    if tool_name.startswith("mcp__") and not mcp_is_safe(tool_name, policy):
+        return "mcp_tool_not_read_only"
+    if tool_name == "WebFetch" and looks_secret(str(ti.get("url", "")), policy):
+        return "secret_in_url"
+    if tool_name == "WebSearch" and looks_secret(str(ti.get("query", "")), policy):
+        return "secret_in_search"
+    return None
+
+
 def decide_from_state(tool_name: str, tool_input: Any, state: Dict[str, Any], policy: Dict[str, Any]) -> Decision:
     risks = classify(tool_name, tool_input, policy)
-    if not risks:
-        return Decision(ALLOW)
-    always = set(policy.get("always_ask_risks") or []).intersection(risks)
-    taint_sources = set(policy.get("taint_sources") or [])
+    taint_sources = set(policy.get("taint_sources") or []) | {"unknown"}  # "unknown": see ledger fail-closed rows
     sources = state.get("sources") or {}
     tainted = [v for k, v in sources.items() if k in taint_sources and v.get("count")]
+    if not risks:
+        why = _unlisted(tool_name, tool_input, policy) if tainted else None
+        if why is None:
+            return Decision(ALLOW)
+        origins = ", ".join(dict.fromkeys(one_line(o, 60) for v in tainted for o in v.get("origins", [])[-2:]))
+        echoes = find_echoes(tool_input, tainted)
+        if echoes:  # an unlisted call that reuses the attacker's URL, address or command
+            reason = f"llm-bouncer: {why} repeats untrusted text (\"{one_line(echoes[0], 80)}\") from {origins}."
+            return Decision(policy.get("on_echo", DENY), reason, [why], echoes)
+        return Decision(ASK, f"llm-bouncer: {why} after reading untrusted content ({origins}). Approve only if you asked.", [why])
+    always = set(policy.get("always_ask_risks") or []).intersection(risks)
     if not tainted:
         if always:
             return Decision(ASK, f"llm-bouncer: touches llm-bouncer itself ({', '.join(sorted(always))}). Approve only if you asked.", risks)

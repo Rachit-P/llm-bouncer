@@ -61,6 +61,10 @@ sensitive_paths:
   - '(^|/)\.(bashrc|zshrc|profile|bash_profile|zprofile|zshenv)$'
   - '(^|/)\.ssh/'
   - '(^|/)\.aws/'
+  # Files that test and build commands execute automatically (npm scripts, pytest's conftest,
+  # setup.py, Cargo build scripts, Makefiles). Editing them, then running an allowlisted
+  # `npm test` or `pytest`, would otherwise run attacker code without a prompt.
+  - '(^|/)(package\.json|conftest\.py|setup\.py|setup\.cfg|pyproject\.toml|tox\.ini|noxfile\.py|build\.rs|Cargo\.toml|Makefile|GNUmakefile|\.npmrc|\.yarnrc(\.yml)?|pytest\.ini)$'
 
 # llm-bouncer's own ledger and policy. Touching them asks every time (see always_ask_risks).
 bouncer_paths:
@@ -85,3 +89,43 @@ mcp_risky_verbs: [send, post, create, delete, remove, update, write, push, merge
 
 # A fetched URL with a very long query string, query value or path segment may be smuggling data out.
 max_fetch_query_chars: 120
+
+# ---------------------------------------------------------------- after untrusted content
+# The red-team showed a list of "risky" commands cannot keep up with a shell (quoting tricks,
+# download-then-run, heredocs, git config, npm scripts...). So once the session has read untrusted
+# content, it flips to an allowlist: Bash and MCP calls run silently only if they are known to be
+# read-only or routine; anything else asks. Sessions that read nothing untrusted are unaffected.
+tainted_mode: allowlist   # allowlist | denylist (denylist = only the risky rules above)
+
+# Commands allowed as the first word of each part of a pipeline / && chain.
+bash_safe_commands: [ls, pwd, cat, head, tail, wc, grep, egrep, fgrep, rg, find, echo, printf, which, type,
+  file, stat, du, df, tree, sort, uniq, cut, tr, diff, cmp, date, whoami, basename, dirname, realpath,
+  readlink, jq, true, false, test, pytest, ruff, mypy, black, isort, eslint, prettier, tsc]
+
+# Allowed multi-word commands (matched on whole leading words).
+bash_safe_prefixes: ["git status", "git diff", "git log", "git show", "git rev-parse", "git ls-files",
+  "git blame", "git describe", "git shortlog", "git grep", "git branch", "git add", "git commit",
+  "git stash", "git switch", "git checkout", "git restore", "git remote -v", "git tag -l",
+  "python -m pytest", "python3 -m pytest", "python -m unittest", "python3 -m unittest",
+  "python --version", "python3 --version", "node --version", "npm test", "npm run test", "npm run lint",
+  "npm run build", "yarn test", "pnpm test", "go test", "go vet", "go build", "cargo test",
+  "cargo check", "cargo build"]
+
+# Arguments that turn an allowed command into one that writes, runs code or talks to the network.
+bash_unsafe_args:
+  find: [-exec, -execdir, -ok, -okdir, -delete, -fprint, -fprint0, -fprintf, -fls]
+  sort: [-o, --output, --compress-program]
+  git: [-c, --exec-path, --upload-pack, --receive-pack, --output, --ext-diff, -O, --open-files-in-pager, --config-env]
+  rg: [--pre, --pre-glob]
+  tree: [-o]
+  date: [-s, --set]
+
+# Ask when a fetched URL or search query carries something that looks like a secret.
+secret_patterns:
+  - '\b(AKIA|ASIA)[0-9A-Z]{16}\b'
+  - '\b(sk|pk|rk)-[A-Za-z0-9_-]{16,}'
+  - '\bgh[pousr]_[A-Za-z0-9]{20,}'
+  - '\bxox[abposr]-[A-Za-z0-9-]{10,}'
+  - '\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}'
+  - '-----BEGIN [A-Z ]*PRIVATE KEY-----'
+min_secret_entropy: 3.5   # bits per char, for unknown tokens of 20+ chars mixing 3+ character classes

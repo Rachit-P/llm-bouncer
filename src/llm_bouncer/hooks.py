@@ -36,21 +36,24 @@ _HINT_SOURCES = {SourceType.WEB, SourceType.MCP, SourceType.TOOL, SourceType.USE
 
 
 def _walk(value: Any) -> Iterator[str]:
-    if value is None or isinstance(value, bool):
-        return
-    if isinstance(value, str):
-        if value:
-            yield value
-    elif isinstance(value, dict):
-        # the usual text keys first, then everything else: attacker text can sit in any field
-        keys = [k for k in _TEXT_KEYS if k in value] + [k for k in value if k not in _TEXT_KEYS]
-        for k in keys:
-            yield from _walk(value[k])
-    elif isinstance(value, (list, tuple)):
-        for v in value:
-            yield from _walk(v)
-    else:
-        yield str(value)
+    # Iterative, not recursive: a malicious MCP server could nest a result thousands of levels
+    # deep to crash a recursive walk, and a crashed labeller recorded nothing.
+    stack = [value]
+    while stack:
+        v = stack.pop()
+        if v is None or isinstance(v, bool):
+            continue
+        if isinstance(v, str):
+            if v:
+                yield v
+        elif isinstance(v, dict):
+            # the usual text keys first, then everything else: attacker text can sit in any field
+            keys = [k for k in _TEXT_KEYS if k in v] + [k for k in v if k not in _TEXT_KEYS]
+            stack.extend(v[k] for k in reversed(keys))
+        elif isinstance(v, (list, tuple)):
+            stack.extend(reversed(v))
+        else:
+            yield str(v)
 
 
 def _flatten(value: Any) -> str:
@@ -124,8 +127,30 @@ def build_note(label: Label, first_of_source: bool = True, tainting: Optional[bo
 # ---------------------------------------------------------------- gate
 
 
+def _ledger_vanished(event: dict) -> bool:
+    """The session has finished tool calls (per Claude Code's transcript) but no ledger exists.
+
+    Every finished tool call writes a ledger row, so this means the ledger was deleted, for
+    example by `find ~ -path '*bouncer*' -delete` to erase the record of an untrusted page.
+    """
+    path = event.get("transcript_path")
+    if not path:
+        return False
+    try:
+        with open(os.path.expanduser(str(path)), "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                if b'"tool_result"' in chunk:
+                    return True
+    except OSError:
+        return False
+    return False
+
+
 def decide_tool_call(event: dict) -> policy.Decision:
     state = ledger.read_state(str(event.get("session_id", "unknown")))
+    if state["turn"] == 0 and _ledger_vanished(event):
+        state = ledger.empty_state()
+        state["sources"]["unknown"] = {"count": 1, "origins": ["ledger missing for a session with earlier tool calls"]}
     return policy.decide_from_state(str(event.get("tool_name", "")), event.get("tool_input"), state, policy.load_policy())
 
 
@@ -153,20 +178,53 @@ def _emit(event_name: str, note: str) -> None:
         _write({"hookEventName": event_name, "additionalContext": note})
 
 
-def _read_event() -> dict:
-    raw = sys.stdin.read()
+def _read_event(raw: Optional[str] = None) -> dict:
+    raw = sys.stdin.read() if raw is None else raw
     event = json.loads(raw) if raw.strip() else {}
     if not isinstance(event, dict):
         raise ValueError("hook input must be a JSON object")
     return event
 
 
+def _field(raw: str, name: str) -> str:
+    import re
+
+    m = re.search(r'"%s"\s*:\s*"([^"\\]{1,200})"' % name, raw)
+    return m.group(1) if m else "unknown"
+
+
+def _fail_closed_label(raw: str, exc: BaseException) -> Label:
+    """A row that taints the session when the real label could not be made.
+
+    Before, a labelling crash (malformed or deeply nested input) recorded nothing, so the session
+    looked clean: the attacker's text was read but never counted.
+    """
+    tool = _field(raw, "tool_name")
+    return Label(
+        session_id=_field(raw, "session_id"),
+        turn=0,
+        source_type=SourceType.UNKNOWN.value,
+        trust="untrusted",
+        origin=tool,
+        tool_name=tool,
+        chars=len(raw),
+        sha256=digest(raw),
+        flags=["label_error"],
+        hints=[{"reason": "label_error", "text": one_line(type(exc).__name__, 60), "start": 0, "end": 0}],
+    )
+
+
 # ---------------------------------------------------------------- commands
 
 
 def _cmd_post_tool_use(args: List[str]) -> int:
-    event = _read_event()
-    label, _, first = ledger.record(label_tool_result(event))
+    raw = sys.stdin.read()
+    try:
+        label = label_tool_result(_read_event(raw))
+    except (Exception, RecursionError) as exc:
+        ledger.record(_fail_closed_label(raw, exc))
+        raise
+    label, _, first = ledger.record(label)
     tainting = label.source_type in set(policy.load_policy().get("taint_sources") or [])
     _emit("PostToolUse", build_note(label, first_of_source=first, tainting=tainting))
     return 0
