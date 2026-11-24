@@ -64,8 +64,8 @@ def _default_text() -> str:
 
 
 def _validate(pol: Dict[str, Any]) -> Dict[str, Any]:
-    for key in ("on_echo", "on_risky_after_taint"):
-        if pol.get(key) not in _ACTIONS:
+    for key in ("on_echo", "on_risky_after_taint", "on_unlisted_after_taint"):
+        if pol.get(key, ASK) not in _ACTIONS:
             raise PolicyError(f"{key} must be one of {_ACTIONS}, got {pol.get(key)!r}")
     if pol.get("tainted_mode", "allowlist") not in ("allowlist", "denylist"):
         raise PolicyError(f"tainted_mode must be allowlist or denylist, got {pol.get('tainted_mode')!r}")
@@ -404,33 +404,69 @@ def _unlisted(tool_name: str, tool_input: Any, policy: Dict[str, Any]) -> Option
     return None
 
 
+CLEAN, TAINTED, REVIEWED = "clean", "tainted", "reviewed"
+
+
+def session_status(state: Dict[str, Any], policy: Dict[str, Any]):
+    """The session's state and the source summaries that put it there.
+
+        clean --(tainting content read)--> tainted --(developer runs `review`)--> reviewed
+                                              ^                                      |
+                                              +------(tainting content read)---------+
+
+    Taint is one-way except through `review`, which only the developer should run (it is a
+    bouncer_tamper action, so the agent asking to run it always needs approval). A source taints
+    if the current policy lists it, if it was stamped as tainting when it was read (so changing
+    the policy later does not clean old sessions), or if it is "unknown" (lost or unreadable
+    labels, a deleted ledger). Only content read after the last review counts.
+    """
+    taint_sources = set(policy.get("taint_sources") or []) | {"unknown"} | set(state.get("taints") or [])
+    reviewed = int(state.get("reviewed_turn") or 0)
+    tainted = [
+        v for k, v in (state.get("sources") or {}).items()
+        if k in taint_sources and v.get("count") and int(v.get("last_turn", reviewed + 1)) > reviewed
+    ]
+    if tainted:
+        return TAINTED, tainted
+    return (REVIEWED if reviewed else CLEAN), []
+
+
 def decide_from_state(tool_name: str, tool_input: Any, state: Dict[str, Any], policy: Dict[str, Any]) -> Decision:
+    """The decision table, first matching row wins.
+
+    | session  | call                          | decision                    |
+    |----------|-------------------------------|-----------------------------|
+    | clean    | touches llm-bouncer itself    | ask                         |
+    | clean    | anything else                 | allow                       |
+    | tainted  | listed and not risky          | allow                       |
+    | tainted  | repeats a tainted URL/email/command | on_echo (deny)        |
+    | tainted  | risky                         | on_risky_after_taint (ask)  |
+    | tainted  | not risky but unlisted        | on_unlisted_after_taint (ask) |
+
+    "touches llm-bouncer itself" (always_ask_risks) is never downgraded to allow.
+    "reviewed" sessions are treated as clean until new tainting content arrives.
+    """
     risks = classify(tool_name, tool_input, policy)
-    taint_sources = set(policy.get("taint_sources") or []) | {"unknown"}  # "unknown": see ledger fail-closed rows
-    sources = state.get("sources") or {}
-    tainted = [v for k, v in sources.items() if k in taint_sources and v.get("count")]
-    if not risks:
-        why = _unlisted(tool_name, tool_input, policy) if tainted else None
-        if why is None:
-            return Decision(ALLOW)
-        origins = ", ".join(dict.fromkeys(one_line(o, 60) for v in tainted for o in v.get("origins", [])[-2:]))
-        echoes = find_echoes(tool_input, tainted)
-        if echoes:  # an unlisted call that reuses the attacker's URL, address or command
-            reason = f"llm-bouncer: {why} repeats untrusted text (\"{one_line(echoes[0], 80)}\") from {origins}."
-            return Decision(policy.get("on_echo", DENY), reason, [why], echoes)
-        return Decision(ASK, f"llm-bouncer: {why} after reading untrusted content ({origins}). Approve only if you asked.", [why])
     always = set(policy.get("always_ask_risks") or []).intersection(risks)
+    _, tainted = session_status(state, policy)
     if not tainted:
         if always:
             return Decision(ASK, f"llm-bouncer: touches llm-bouncer itself ({', '.join(sorted(always))}). Approve only if you asked.", risks)
         return Decision(ALLOW, risk=risks)
+    if risks:
+        why, knob = risks, "on_risky_after_taint"
+    else:
+        unlisted = _unlisted(tool_name, tool_input, policy)
+        if unlisted is None:
+            return Decision(ALLOW)
+        why, knob = [unlisted], "on_unlisted_after_taint"
     origins = ", ".join(dict.fromkeys(one_line(o, 60) for v in tainted for o in v.get("origins", [])[-2:]))
     echoes = find_echoes(tool_input, tainted)
     if echoes:
-        reason = f"llm-bouncer: {', '.join(risks)} repeats untrusted text (\"{one_line(echoes[0], 80)}\") from {origins}."
-        return Decision(policy.get("on_echo", DENY), reason, risks, echoes)
-    action = policy.get("on_risky_after_taint", ASK)
+        reason = f"llm-bouncer: {', '.join(why)} repeats untrusted text (\"{one_line(echoes[0], 80)}\") from {origins}."
+        return Decision(policy.get("on_echo", DENY), reason, why, echoes)
+    action = policy.get(knob, ASK)
     if action == ALLOW and always:
         action = ASK
-    reason = f"llm-bouncer: {', '.join(risks)} after reading untrusted content ({origins}). Approve only if you asked."
-    return Decision(action, reason, risks)
+    reason = f"llm-bouncer: {', '.join(why)} after reading untrusted content ({origins}). Approve only if you asked."
+    return Decision(action, reason, why)

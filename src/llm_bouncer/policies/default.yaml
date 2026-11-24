@@ -14,6 +14,8 @@ always_ask_risks: [bouncer_tamper]
 on_echo: deny        # deny | ask
 # What to do when a risky action runs after tainted text was read in this session.
 on_risky_after_taint: ask   # ask | deny | allow
+# What to do with a call that is not risky but is not on the allowlist below (tainted sessions).
+on_unlisted_after_taint: ask   # ask | deny | allow
 
 # Risky Bash commands, by category (Python regex, case-insensitive).
 bash_risky:
@@ -71,6 +73,8 @@ bouncer_paths:
   - '\.llm-bouncer\b'
   - '\bLLM_BOUNCER_'
   - '\b(pip3?|pipx|uv|conda|python3?\s+-m\s+pip)\b.*\b(uninstall|remove)\b.*\bllm[-_]bouncer\b'
+  # `llm-bouncer review` marks a tainted session as reviewed: only the developer may do that.
+  - '\bllm[-_]bouncer(\.hooks)?\s+review\b'
   # Claude Code settings hold the hooks themselves: removing them switches the gate off.
   - '(^|[\s/''"=>])\.claude/settings(\.local)?\.json\b'
   - '(^|[\s/''"=>])\.claude\.json\b'

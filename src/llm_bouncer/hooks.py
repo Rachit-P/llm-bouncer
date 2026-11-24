@@ -6,6 +6,7 @@ Claude Code runs a hook as a command, passes JSON on stdin, and reads JSON from 
     llm-bouncer user-prompt       # UserPromptSubmit: label the developer's prompt
     llm-bouncer pre-tool-use      # PreToolUse: allow, ask or deny the next tool call
     llm-bouncer show [SESSION_ID] # list sessions, or print one session's ledger
+    llm-bouncer review SESSION_ID # you checked the session: content read so far stops tainting it
     llm-bouncer eval [PATH] [--policy FILE] [--json] [--check]  # score the gate on attack/harmless scenarios
 
 Set LLM_BOUNCER_MODE=monitor to log pre-tool-use decisions without enforcing them.
@@ -18,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 from typing import Any, Callable, Dict, Iterator, List, Optional
@@ -127,30 +129,66 @@ def build_note(label: Label, first_of_source: bool = True, tainting: Optional[bo
 # ---------------------------------------------------------------- gate
 
 
-def _ledger_vanished(event: dict) -> bool:
-    """The session has finished tool calls (per Claude Code's transcript) but no ledger exists.
+_RESULT = re.compile(rb'"tool_result"')
 
-    Every finished tool call writes a ledger row, so this means the ledger was deleted, for
-    example by `find ~ -path '*bouncer*' -delete` to erase the record of an untrusted page.
+
+def _earlier_results(event: dict) -> int:
+    """How many tool results Claude Code's transcript holds, not counting this call's own.
+
+    Strings inside the transcript are JSON-escaped, so page text that says "tool_result" cannot
+    inflate the count.
     """
     path = event.get("transcript_path")
     if not path:
-        return False
+        return 0
     try:
         with open(os.path.expanduser(str(path)), "rb") as fh:
-            for chunk in iter(lambda: fh.read(1 << 20), b""):
-                if b'"tool_result"' in chunk:
-                    return True
+            data = fh.read()
     except OSError:
-        return False
-    return False
+        return 0
+    n = len(_RESULT.findall(data))
+    own = event.get("tool_use_id")
+    if own and re.search(rb'"tool_use_id"\s*:\s*"' + re.escape(str(own).encode()) + rb'"', data):
+        n -= 1
+    return n
+
+
+def _check_ledger_vanished(event: dict, in_flight: int = 0) -> None:
+    """Make "the ledger was deleted" a permanent part of the session.
+
+    If the ledger is empty but the transcript shows earlier tool results, the record of what the
+    agent read is gone: deleted (e.g. `find ~ -path '*bouncer*' -delete`) or pruned after a long
+    pause. Before, this was only re-derived while the ledger stayed empty, so the first harmless
+    call after the deletion wrote a row and wiped the suspicion. Now a tainting row is written.
+
+    `in_flight` is how many results may belong to the current call when its tool_use_id is not
+    known (PostToolUse: 1).
+    """
+    sid = str(event.get("session_id", "unknown"))
+    if ledger.read_state(sid)["turn"] != 0:
+        return
+    if _earlier_results(event) > (0 if event.get("tool_use_id") else in_flight):
+        ledger.record(_tamper_label(sid), taints=True)
+
+
+def _tamper_label(sid: str) -> Label:
+    return Label(session_id=sid, turn=0, source_type=SourceType.UNKNOWN.value, trust="untrusted",
+                 origin="ledger missing for a session with earlier tool calls", tool_name=None,
+                 chars=0, sha256="", flags=["ledger_missing"])
 
 
 def decide_tool_call(event: dict) -> policy.Decision:
-    state = ledger.read_state(str(event.get("session_id", "unknown")))
-    if state["turn"] == 0 and _ledger_vanished(event):
-        state = ledger.empty_state()
-        state["sources"]["unknown"] = {"count": 1, "origins": ["ledger missing for a session with earlier tool calls"]}
+    sid = str(event.get("session_id", "unknown"))
+    _check_ledger_vanished(event)
+    state = ledger.read_state(sid, persist=True)
+    if ledger.is_dirty(sid):  # a label was lost: the session cannot be shown to be clean
+        state["sources"].setdefault("unknown", {"count": 1, "origins": ["a label that could not be saved"]})
+    overflow = ledger.overflow_hashes(sid) if state["sources"] else {}
+    for stype, kinds in overflow.items():
+        src = state["sources"].get(stype)
+        if src:
+            src["url_h"] = list(src.get("url_h", [])) + list(kinds["u"])
+            src["email_h"] = list(src.get("email_h", [])) + list(kinds["e"])
     return policy.decide_from_state(str(event.get("tool_name", "")), event.get("tool_input"), state, policy.load_policy())
 
 
@@ -217,22 +255,50 @@ def _fail_closed_label(raw: str, exc: BaseException) -> Label:
 # ---------------------------------------------------------------- commands
 
 
+def _taints(label: Label) -> bool:
+    if label.source_type == SourceType.UNKNOWN.value:
+        return True
+    try:
+        return label.source_type in set(policy.load_policy().get("taint_sources") or [])
+    except Exception:  # a broken policy must not lose the label; untrusted content taints
+        return label.trust == "untrusted" and label.source_type != SourceType.INTERNAL.value
+
+
+def _save(label: Label) -> tuple:
+    """Record a label; if that fails, leave a marker so the session fails closed."""
+    tainting = _taints(label)
+    try:
+        label, _, first = ledger.record(label, taints=tainting)
+    except BaseException:
+        ledger.mark_dirty(label.session_id)
+        raise
+    return label, first, tainting
+
+
 def _cmd_post_tool_use(args: List[str]) -> int:
     raw = sys.stdin.read()
+    error: Optional[BaseException] = None
     try:
-        label = label_tool_result(_read_event(raw))
+        event = _read_event(raw)
+        label = label_tool_result(event)
     except (Exception, RecursionError) as exc:
-        ledger.record(_fail_closed_label(raw, exc))
-        raise
-    label, _, first = ledger.record(label)
-    tainting = label.source_type in set(policy.load_policy().get("taint_sources") or [])
+        event, label, error = {}, _fail_closed_label(raw, exc), exc
+    if event:
+        try:
+            _check_ledger_vanished(event, in_flight=1)
+        except OSError:
+            ledger.mark_dirty(label.session_id)
+    label, first, tainting = _save(label)
+    if error is not None:
+        raise error
     _emit("PostToolUse", build_note(label, first_of_source=first, tainting=tainting))
     return 0
 
 
 def _cmd_user_prompt(args: List[str]) -> int:
     event = _read_event()
-    label, _, _ = ledger.record(label_user_prompt(event))
+    _check_ledger_vanished(event)
+    label, _, _ = _save(label_user_prompt(event))
     _emit("UserPromptSubmit", build_note(label))
     return 0
 
@@ -256,6 +322,24 @@ def _cmd_pre_tool_use(args: List[str]) -> int:
         )
     if mode != "monitor":
         _emit_decision(decision)
+    return 0
+
+
+def _cmd_review(args: List[str]) -> int:
+    if not args:
+        print("usage: llm-bouncer review SESSION_ID  (see `llm-bouncer show` for session ids)", file=sys.stderr)
+        return 2
+    sid = args[0]
+    pol = policy.load_policy()
+    status, tainted = policy.session_status(ledger.read_state(sid), pol)
+    if status != policy.TAINTED:
+        print(f"{sid}: {status}, nothing to review")
+        return 0
+    for stype, v in ledger.read_state(sid)["sources"].items():
+        if v in tainted:
+            print(f"  {stype}: {v.get('count')} item(s), e.g. {', '.join(v.get('origins', []))}")
+    ledger.record_review(sid)
+    print(f"{sid}: marked reviewed. Content read from now on taints the session again.")
     return 0
 
 
@@ -284,6 +368,8 @@ def main(argv: Optional[list] = None) -> int:
         from .evals import runner
 
         return runner.main(args[1:])
+    if cmd == "review":  # a command for people: errors should be seen, not swallowed
+        return _cmd_review(args[1:])
     handler = _HOOKS.get(cmd)
     if handler is None:
         print(__doc__, file=sys.stderr)

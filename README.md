@@ -4,7 +4,7 @@
 
 AI agents read a lot of text they did not write: web pages, files, command output, MCP tool results. Any of it can contain hidden instructions. `llm-bouncer` keeps a record of *what* the agent read and *where it came from*, and checks every tool call against that record before it runs.
 
-> **Status: v0.5.0.** Labelling (v0), a pre-tool-use gate (v1) and an evaluation kit. Every decision comes from fixed rules, not from a model.
+> **Status: v0.6.0.** Labelling (v0), a pre-tool-use gate (v1) and an evaluation kit. Every decision comes from fixed rules, not from a model.
 
 ## What it does
 
@@ -32,7 +32,9 @@ Each ledger entry (`~/.llm-bouncer/sessions/<session>.jsonl`) records:
 
 4. **After untrusted content, allowlist only.** Once the session has read web, MCP or other outside content, a Bash command runs without a prompt only if every part of it is on a short read-only/routine allowlist (`ls`, `cat`, `grep`, `find` without `-exec`/`-delete`, `git status`/`diff`/`log`/`add`/`commit`, test runners…). Command substitution, heredocs, redirections, env-var prefixes and `./script` always ask. MCP tools ask unless their name starts with a read-only verb (`get_`, `list_`, `search_`…), and fetch URLs or search queries that look like they carry a secret ask. A red-team showed that a list of "risky" commands alone cannot keep up with what a shell can do (`c''url`, download-then-run, `git config core.hooksPath`, npm `postinstall`). Set `tainted_mode: denylist` to go back to rules 1–3 only.
 
-If labelling a tool result crashes (for example on a maliciously nested MCP result), the session is still marked as having read untrusted content. If the ledger disappears while Claude Code's transcript shows earlier tool calls, the session is treated the same way.
+If labelling a tool result crashes (for example on a maliciously nested MCP result), or its label cannot be saved (a full disk), the session is still marked as having read untrusted content. If the ledger disappears while Claude Code's transcript shows earlier tool calls, the session is treated the same way, permanently.
+
+Taint only goes one way. To clear it after you have checked what the agent read, run `llm-bouncer review SESSION_ID` yourself (`llm-bouncer show` lists sessions); anything untrusted read afterwards taints the session again. The agent asking to run `review` always needs your approval. The session states and the decision table are in [docs/state-machines.md](docs/state-machines.md).
 
 Risky calls in a session with no untrusted reading, and harmless calls at any time, pass through untouched; sessions that never read outside content behave exactly as before. The agent's own Edit, Write and todo-list results never taint the session. File and command output are labelled untrusted but do not trigger rule 3 by default (they would ask too often); add them to `taint_sources` for a stricter mode.
 
@@ -125,7 +127,8 @@ The asked rate on harmless work after reading the web rose to 37% with allowlist
 
 - The echo check matches text exactly (after whitespace and case normalisation). An attacker who gets the model to rewrite the command, or to build it from pieces, gets an **ask** rather than a **deny**.
 - Risky-action rules are regexes; in a session that read untrusted content the allowlist backs them up, but the allowlist is only as tight as the commands on it (test runners execute project code).
-- Taint lasts for the whole session. Once the agent reads a web page, every later risky action asks.
+- Taint lasts until you run `llm-bouncer review`. Once the agent reads a web page, every later risky action asks.
+- Tamper detection relies on Claude Code's transcript. Deleting the ledger *and* the transcript, or deleting the ledger after exactly one tool call when the hook input has no `tool_use_id`, is not noticed.
 - Hints are simple rules, not a classifier. They miss paraphrased attacks and can flag harmless text.
 - Trust is per source type. `file` and `command` output is treated as untrusted because attackers can plant text there.
 - Pasted text inside a prompt is not yet separated from typed text (`user_pasted` is reserved).
@@ -136,9 +139,10 @@ The asked rate on harmless work after reading the web rose to 37% with allowlist
 1. **v0:** text labelling and session ledger.
 2. **v1:** pre-tool-use gate with risky-action rules, echo check, editable policy and monitor mode.
 3. **v1 eval kit:** replayed attack and harmless scenarios, catch and false-alarm rates, policy comparison.
-4. **v0.5 (this release):** allowlist mode after untrusted content, fail-closed labelling, tamper detection, red-team scenarios.
-5. **Next:** live runs against real models (how often each one is fooled, with and without llm-bouncer).
-6. Pasted-text labelling, plug-in detectors, adapters for other agent frameworks.
+4. **v0.5:** allowlist mode after untrusted content, fail-closed labelling, tamper detection, red-team scenarios.
+5. **v0.6 (this release):** explicit session states: sticky tamper detection, fail-closed storage, monotonic taint with `review`, overflow store for echo hashes.
+6. **Next:** live runs against real models (how often each one is fooled, with and without llm-bouncer).
+7. Pasted-text labelling, plug-in detectors, adapters for other agent frameworks.
 
 ## Development
 
