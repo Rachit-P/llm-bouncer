@@ -66,7 +66,10 @@ sensitive_paths:
 bouncer_paths:
   - '\.llm-bouncer\b'
   - '\bLLM_BOUNCER_'
-  - '\bllm-bouncer\b.*\buninstall\b'
+  - '\b(pip3?|pipx|uv|conda|python3?\s+-m\s+pip)\b.*\b(uninstall|remove)\b.*\bllm[-_]bouncer\b'
+  # Claude Code settings hold the hooks themselves: removing them switches the gate off.
+  - '(^|[\s/''"=>])\.claude/settings(\.local)?\.json\b'
+  - '(^|[\s/''"=>])\.claude\.json\b'
 
 # Reading these paths is risky (secrets the agent could then send out).
 secret_paths:

@@ -28,10 +28,13 @@ except ImportError:  # Windows: no advisory locks; writes are still single os.wr
     fcntl = None
 
 from .labels import Label
+from .textnorm import key_hash, norm, url_key
 
 STATE_VERSION = 1
 MAX_ORIGINS = 3
-MAX_INDICATORS = 200  # per kind, per source type
+MAX_COMMANDS = 5000  # per source type; the oldest are dropped first
+MAX_READABLE = 50  # recent URLs/emails kept as text, for `show` and reasons
+MAX_HASHES = 200_000  # URL/email key hashes per kind and source type (16 chars each)
 _KINDS = ("commands", "urls", "emails")
 
 
@@ -78,10 +81,21 @@ def _ensure_dir() -> Path:
 # ---------------------------------------------------------------- low-level io
 
 
-def _append_line(path: Path, obj: dict) -> None:
+def _ends_mid_line(path: Path) -> bool:
+    """True if the file's last write was cut off before its newline (a crash or a full disk)."""
+    try:
+        with path.open("rb") as fh:
+            fh.seek(-1, os.SEEK_END)
+            return fh.read(1) != b"\n"
+    except OSError:  # missing or empty
+        return False
+
+
+def _append_line(path: Path, obj: dict, newline_first: bool = False) -> None:
     # One os.write on an O_APPEND fd: parallel hooks cannot interleave half-lines,
-    # which buffered file writes over 8 KB could.
-    data = (json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+    # which buffered file writes over 8 KB could. newline_first closes a torn last line so it
+    # does not swallow this row too.
+    data = (("\n" if newline_first else "") + json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
     fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
     try:
         os.write(fd, data)
@@ -129,10 +143,23 @@ def _fold(state: dict, row: dict) -> None:
     for kind, items in (row.get("indicators") or {}).items():
         if kind not in _KINDS:
             continue
-        have = src.setdefault(kind, [])
-        for item in items:
-            if item not in have and len(have) < MAX_INDICATORS:
-                have.append(item)
+        # Keep the most recent, de-duplicated. The old cap (first 200 kept, later ones dropped)
+        # let a page fill the list with decoys so the real payload was never stored.
+        cap = MAX_COMMANDS if kind == "commands" else MAX_READABLE
+        src[kind] = _recent(src.get(kind, []), items, cap)
+        if kind != "commands":
+            # Every URL and email is kept as a short hash, so decoys cannot push the payload out.
+            keyf = url_key if kind == "urls" else norm
+            src[kind[:-1] + "_h"] = _recent(src.get(kind[:-1] + "_h", []), [key_hash(keyf(i)) for i in items], MAX_HASHES)
+
+
+def _recent(have: List[str], new: List[str], cap: int) -> List[str]:
+    d = dict.fromkeys(have)
+    for item in new:
+        d.pop(item, None)
+        d[item] = None
+    out = list(d)
+    return out[-cap:]
 
 
 def state_from_rows(rows: List[dict]) -> dict:
@@ -142,19 +169,35 @@ def state_from_rows(rows: List[dict]) -> dict:
     return state
 
 
+def _size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except FileNotFoundError:
+        return 0
+
+
 def read_state(session_id: str, cwd: str | None = None) -> dict:
     """The session summary. Rebuilt from the log if it is missing or damaged."""
     path = _state_path(session_id)
     try:
         state = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(state, dict) and state.get("v") == STATE_VERSION and isinstance(state.get("sources"), dict):
+        if (
+            isinstance(state, dict)
+            and state.get("v") == STATE_VERSION
+            and isinstance(state.get("sources"), dict)
+            # The summary must describe the log as it is now. If a hook died between appending a
+            # row and saving the summary (or the log was edited), the summary is stale: rebuild.
+            and state.get("ledger_bytes") == _size(ledger_path(session_id))
+        ):
             return state
     except FileNotFoundError:
         if not ledger_path(session_id).exists():
             return empty_state()
     except (OSError, ValueError):
         pass
-    return state_from_rows(read_all(session_id))
+    state = state_from_rows(read_all(session_id))
+    state["ledger_bytes"] = _size(ledger_path(session_id))
+    return state
 
 
 # ---------------------------------------------------------------- public api
@@ -172,8 +215,10 @@ def record(label: Label, cwd: str | None = None) -> Tuple[Label, dict, bool]:
         first_of_source = label.source_type not in state["sources"]
         label.turn = int(state["turn"]) + 1
         row = label.to_dict()
-        _append_line(ledger_path(label.session_id), row)
+        log = ledger_path(label.session_id)
+        _append_line(log, row, newline_first=_ends_mid_line(log))
         _fold(state, row)
+        state["ledger_bytes"] = _size(log)
         _write_atomic(_state_path(label.session_id), state)
     if new_session:
         prune()
@@ -224,6 +269,12 @@ def sessions() -> List[str]:
     return sorted(p.name[: -len(".jsonl")] for p in d.glob("*.jsonl") if not p.name.endswith(".decisions.jsonl"))
 
 
+_OWN_FILE = re.compile(
+    r"^(?:[A-Za-z0-9_.-]+\.(?:jsonl|decisions\.jsonl|state\.json|lock)"
+    r"|policy\.cache\.json|\.[A-Za-z0-9_.-]+\.\d+\.tmp|\.policy\.cache\.\d+\.tmp)$"
+)
+
+
 def prune(days: Optional[float] = None) -> int:
     """Delete session files untouched for `days` (default $LLM_BOUNCER_RETENTION_DAYS or 30).
 
@@ -242,7 +293,9 @@ def prune(days: Optional[float] = None) -> int:
     if not d.exists():
         return 0
     for p in d.iterdir():
-        if p.suffix in (".jsonl", ".json", ".lock") or p.name.endswith(".tmp"):
+        # Only files llm-bouncer itself creates: LLM_BOUNCER_DIR may point at a folder that
+        # holds other things, and those must never be deleted.
+        if _OWN_FILE.match(p.name):
             try:
                 if p.stat().st_mtime < cutoff:
                     p.unlink()

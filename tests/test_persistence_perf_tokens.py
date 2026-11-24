@@ -70,7 +70,9 @@ def test_state_matches_ledger_and_turns_are_sequential():
         _web(url=f"https://d{i}.example")
     rows = ledger.read_all(SID)
     assert [r["turn"] for r in rows] == [1, 2, 3, 4, 5]
-    assert ledger.read_state(SID) == ledger.state_from_rows(rows)
+    state = ledger.read_state(SID)
+    assert state.pop("ledger_bytes") == ledger.ledger_path(SID).stat().st_size
+    assert state == ledger.state_from_rows(rows)
 
 
 def test_parallel_hooks_do_not_lose_or_duplicate_turns():

@@ -31,6 +31,26 @@ def norm(text: str) -> str:
     return re.sub(r"\s+", " ", clean(text)).strip().lower()
 
 
+def url_key(url: str) -> str:
+    """Canonical form of a URL for echo matching: no scheme, lower-case, no trailing slash."""
+    u = norm(url)
+    u = re.sub(r"^[a-z][a-z0-9+.-]*://", "", u)  # http and https are the same destination
+    return u.rstrip("/.,;:")
+
+
+def url_keys(url: str) -> list:
+    """The URL's key, plus the key without its query/fragment (an added "?x=1" is the same URL)."""
+    k = url_key(url)
+    base = re.split(r"[?#]", k, maxsplit=1)[0].rstrip("/")
+    return [k] if base == k else [k, base]
+
+
+def key_hash(key: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(key.encode("utf-8", "replace")).hexdigest()[:16]
+
+
 def one_line(text: str, limit: int = 120) -> str:
     """Untrusted text made safe to quote in a note or reason: one line, printable, short."""
     text = re.sub(r"\s+", " ", clean(str(text))).strip()
