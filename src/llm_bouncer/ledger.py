@@ -4,8 +4,14 @@ Two files per session, in ~/.llm-bouncer/sessions/ (or $LLM_BOUNCER_DIR):
 
 * ``<session>.jsonl``: append-only audit log, one label per line. Never read on the hot path.
 * ``<session>.state.json``: a small summary the hooks actually use: turn counter, and per source
-  type the count, last origins and the indicators seen. Reading it costs the same on turn 5 and
-  turn 5,000, unlike re-reading the whole log on every tool call.
+  type the count, last turn, last origins and the indicators seen. Reading it costs the same on
+  turn 5 and turn 5,000, unlike re-reading the whole log on every tool call.
+* ``<session>.hashes``: URL/email hashes pushed out of the summary by its size cap. Append-only and
+  read only for echo checks, so flooding a session with decoys cannot make it forget the payload.
+* ``<session>.dirty``: an empty marker meaning "a label could not be saved". It taints the
+  session until the next successful write turns it into a ledger row.
+
+The session's states (clean, tainted, reviewed) are described in docs/state-machines.md.
 
 Writes take a per-session lock, because Claude Code runs hooks for parallel tool calls at the same
 time. Files are created private (0600) since they hold URLs and commands the agent saw.
@@ -20,7 +26,7 @@ import re
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 try:
     import fcntl
@@ -30,11 +36,12 @@ except ImportError:  # Windows: no advisory locks; writes are still single os.wr
 from .labels import Label
 from .textnorm import key_hash, norm, url_key
 
-STATE_VERSION = 1
+STATE_VERSION = 2  # 2: per-source last_turn, stamped taint, review rows
 MAX_ORIGINS = 3
 MAX_COMMANDS = 5000  # per source type; the oldest are dropped first
 MAX_READABLE = 50  # recent URLs/emails kept as text, for `show` and reasons
-MAX_HASHES = 200_000  # URL/email key hashes per kind and source type (16 chars each)
+MAX_HASHES = 20_000  # URL/email key hashes per kind and source type kept in the summary; older ones
+# move to the append-only <session>.hashes file instead of being forgotten
 _KINDS = ("commands", "urls", "emails")
 
 
@@ -66,6 +73,14 @@ def ledger_path(session_id: str, cwd: str | None = None) -> Path:
 
 def _state_path(session_id: str) -> Path:
     return ledger_dir() / f"{_safe(session_id)}.state.json"
+
+
+def _hashes_path(session_id: str) -> Path:
+    return ledger_dir() / f"{_safe(session_id)}.hashes"
+
+
+def _dirty_path(session_id: str) -> Path:
+    return ledger_dir() / f"{_safe(session_id)}.dirty"
 
 
 def _decisions_path(session_id: str) -> Path:
@@ -117,9 +132,21 @@ def _locked(session_id: str) -> Iterator[None]:
     if fcntl is None:
         yield
         return
-    fd = os.open(ledger_dir() / f"{_safe(session_id)}.lock", os.O_WRONLY | os.O_CREAT, 0o600)
-    try:
+    path = ledger_dir() / f"{_safe(session_id)}.lock"
+    while True:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
         fcntl.flock(fd, fcntl.LOCK_EX)
+        # If prune() unlinked the lock file while we waited, we hold a lock on a file nobody else
+        # will open: a second hook would create a new one and both would write at once. Retry
+        # until the locked file is the one at the path.
+        try:
+            same = os.fstat(fd).st_ino == os.stat(path).st_ino
+        except FileNotFoundError:
+            same = False
+        if same:
+            break
+        os.close(fd)
+    try:
         yield
     finally:
         os.close(fd)  # closing releases the lock
@@ -129,14 +156,28 @@ def _locked(session_id: str) -> Iterator[None]:
 
 
 def empty_state() -> dict:
-    return {"v": STATE_VERSION, "turn": 0, "sources": {}}
+    # taints: source types that tainted the session under the policy in force when they were
+    # read. Kept so that later removing a source from taint_sources cannot un-taint old sessions.
+    # reviewed_turn: the developer marked everything up to this turn as reviewed (`review`).
+    return {"v": STATE_VERSION, "turn": 0, "sources": {}, "taints": [], "reviewed_turn": 0}
 
 
-def _fold(state: dict, row: dict) -> None:
-    """Add one ledger row to a state summary."""
-    state["turn"] = max(int(state.get("turn", 0)), int(row.get("turn") or 0))
-    src = state["sources"].setdefault(str(row.get("source_type")), {"count": 0, "origins": []})
+def _fold(state: dict, row: dict, evicted: Optional[List[str]] = None) -> None:
+    """Add one ledger row to a state summary.
+
+    Hashes pushed out by the cap are added to `evicted` as "<source> <u|e> <hash>" lines.
+    """
+    turn = int(row.get("turn") or 0)
+    state["turn"] = max(int(state.get("turn", 0)), turn)
+    if row.get("event") == "review":
+        state["reviewed_turn"] = max(int(state.get("reviewed_turn", 0)), turn)
+        return
+    stype = str(row.get("source_type"))
+    if row.get("taints") and stype not in state["taints"]:
+        state["taints"].append(stype)
+    src = state["sources"].setdefault(stype, {"count": 0, "origins": []})
     src["count"] += 1
+    src["last_turn"] = max(int(src.get("last_turn", 0)), turn)
     origin = str(row.get("origin", "?"))
     origins = [o for o in src["origins"] if o != origin] + [origin]
     src["origins"] = origins[-MAX_ORIGINS:]
@@ -150,23 +191,44 @@ def _fold(state: dict, row: dict) -> None:
         if kind != "commands":
             # Every URL and email is kept as a short hash, so decoys cannot push the payload out.
             keyf = url_key if kind == "urls" else norm
-            src[kind[:-1] + "_h"] = _recent(src.get(kind[:-1] + "_h", []), [key_hash(keyf(i)) for i in items], MAX_HASHES)
+            dropped = [] if evicted is not None else None
+            src[kind[:-1] + "_h"] = _recent(src.get(kind[:-1] + "_h", []), [key_hash(keyf(i)) for i in items], MAX_HASHES, dropped)
+            if dropped:
+                evicted.extend(f"{stype} {kind[0]} {h}" for h in dropped)
 
 
-def _recent(have: List[str], new: List[str], cap: int) -> List[str]:
+def _recent(have: List[str], new: List[str], cap: int, dropped: Optional[List[str]] = None) -> List[str]:
     d = dict.fromkeys(have)
     for item in new:
         d.pop(item, None)
         d[item] = None
     out = list(d)
+    if dropped is not None and len(out) > cap:
+        dropped.extend(out[:-cap])
     return out[-cap:]
 
 
 def state_from_rows(rows: List[dict]) -> dict:
+    # Rebuilding never writes the overflow file: hashes evicted here were already saved there
+    # when their rows were first recorded.
     state = empty_state()
     for row in rows:
         _fold(state, row)
     return state
+
+
+def overflow_hashes(session_id: str) -> Dict[str, Dict[str, set]]:
+    """Hashes evicted from the summary, by source type: {"web": {"u": {...}, "e": {...}}}."""
+    out: Dict[str, Dict[str, set]] = {}
+    try:
+        with _hashes_path(session_id).open(encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) == 3 and parts[1] in ("u", "e"):
+                    out.setdefault(parts[0], {"u": set(), "e": set()})[parts[1]].add(parts[2])
+    except OSError:
+        pass
+    return out
 
 
 def _size(path: Path) -> int:
@@ -176,8 +238,12 @@ def _size(path: Path) -> int:
         return 0
 
 
-def read_state(session_id: str, cwd: str | None = None) -> dict:
-    """The session summary. Rebuilt from the log if it is missing or damaged."""
+def read_state(session_id: str, cwd: str | None = None, persist: bool = False) -> dict:
+    """The session summary. Rebuilt from the log if it is missing or damaged.
+
+    With persist=True a rebuilt summary is saved, so the next hook does not re-read the whole log
+    again. Callers already holding the session lock must leave it False (flock is per open file).
+    """
     path = _state_path(session_id)
     try:
         state = json.loads(path.read_text(encoding="utf-8"))
@@ -197,32 +263,113 @@ def read_state(session_id: str, cwd: str | None = None) -> dict:
         pass
     state = state_from_rows(read_all(session_id))
     state["ledger_bytes"] = _size(ledger_path(session_id))
+    if persist:
+        try:
+            with _locked(session_id):
+                # Save only if no hook appended in the meantime; otherwise its own save wins.
+                if state["ledger_bytes"] == _size(ledger_path(session_id)):
+                    _write_atomic(_state_path(session_id), state)
+        except OSError:
+            pass  # saving the summary is an optimisation only
     return state
+
+
+def is_dirty(session_id: str) -> bool:
+    return _dirty_path(session_id).exists() or _fallback_dirty_path(session_id).exists()
+
+
+def _fallback_dirty_path(session_id: str) -> Path:
+    import tempfile
+
+    uid = os.getuid() if hasattr(os, "getuid") else 0
+    return Path(tempfile.gettempdir()) / f"llm-bouncer-{uid}-{_safe(session_id)}.dirty"
+
+
+def mark_dirty(session_id: str) -> bool:
+    """Record that a label was lost, so the session fails closed. True if a marker was written.
+
+    Creating an empty file usually still works when appending to the ledger does not (a full
+    disk); if the ledger folder itself is unusable, the system temp folder is tried.
+    """
+    for path in (_dirty_path(session_id), _fallback_dirty_path(session_id)):
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.close(os.open(path, os.O_WRONLY | os.O_CREAT, 0o600))
+            return True
+        except OSError:
+            continue
+    return False
 
 
 # ---------------------------------------------------------------- public api
 
 
-def record(label: Label, cwd: str | None = None) -> Tuple[Label, dict, bool]:
+def _add_row(session_id: str, state: dict, row: dict, evicted: List[str]) -> None:
+    log = ledger_path(session_id)
+    _append_line(log, row, newline_first=_ends_mid_line(log))
+    _fold(state, row, evicted)
+
+
+def record(label: Label, cwd: str | None = None, taints: Optional[bool] = None) -> Tuple[Label, dict, bool]:
     """Append a label and update the state, atomically per session.
 
-    Returns (label with its turn set, new state, whether this is the session's first
-    label from this source type).
+    `taints` stamps whether the current policy counts this source as tainting, so the session
+    stays tainted even if the policy later changes. Returns (label with its turn set, new state,
+    whether this is the session's first label from this source type).
     """
-    with _locked(label.session_id):
-        state = read_state(label.session_id)
-        new_session = state["turn"] == 0 and not _state_path(label.session_id).exists()
+    sid = label.session_id
+    with _locked(sid):
+        state = read_state(sid)
+        new_session = state["turn"] == 0 and not _state_path(sid).exists()
+        evicted: List[str] = []
+        dirty = [p for p in (_dirty_path(sid), _fallback_dirty_path(sid)) if p.exists()]
+        if dirty:
+            # An earlier label was lost: turn the marker into a permanent tainting row.
+            state["turn"] = int(state["turn"]) + 1
+            _add_row(sid, state, {"session_id": sid, "turn": state["turn"], "source_type": "unknown",
+                                  "trust": "untrusted", "origin": "a label that could not be saved",
+                                  "flags": ["write_error"], "taints": True, "ts": time.time()}, evicted)
         first_of_source = label.source_type not in state["sources"]
         label.turn = int(state["turn"]) + 1
         row = label.to_dict()
-        log = ledger_path(label.session_id)
-        _append_line(log, row, newline_first=_ends_mid_line(log))
-        _fold(state, row)
-        state["ledger_bytes"] = _size(log)
-        _write_atomic(_state_path(label.session_id), state)
+        if taints is not None:
+            row["taints"] = bool(taints)
+        _add_row(sid, state, row, evicted)
+        if evicted:
+            _append_text(_hashes_path(sid), "\n".join(evicted) + "\n")
+        state["ledger_bytes"] = _size(ledger_path(sid))
+        _write_atomic(_state_path(sid), state)
+        for p in dirty:
+            try:
+                p.unlink()
+            except OSError:
+                pass
     if new_session:
         prune()
     return label, state, first_of_source
+
+
+def record_review(session_id: str) -> dict:
+    """The developer reviewed the session: content read so far no longer taints it.
+
+    Anything tainting read after this point taints the session again. Written as a ledger row so
+    a rebuilt summary keeps it.
+    """
+    with _locked(session_id):
+        state = read_state(session_id)
+        state["turn"] = int(state["turn"]) + 1
+        _add_row(session_id, state, {"event": "review", "session_id": session_id, "turn": state["turn"], "ts": time.time()}, [])
+        state["ledger_bytes"] = _size(ledger_path(session_id))
+        _write_atomic(_state_path(session_id), state)
+    return state
+
+
+def _append_text(path: Path, text: str) -> None:
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        os.write(fd, text.encode("utf-8"))
+    finally:
+        os.close(fd)
 
 
 def append(label: Label, cwd: str | None = None) -> Path:
@@ -270,7 +417,7 @@ def sessions() -> List[str]:
 
 
 _OWN_FILE = re.compile(
-    r"^(?:[A-Za-z0-9_.-]+\.(?:jsonl|decisions\.jsonl|state\.json|lock)"
+    r"^(?:[A-Za-z0-9_.-]+\.(?:jsonl|decisions\.jsonl|state\.json|lock|hashes|dirty)"
     r"|policy\.cache\.json|\.[A-Za-z0-9_.-]+\.\d+\.tmp|\.policy\.cache\.\d+\.tmp)$"
 )
 
