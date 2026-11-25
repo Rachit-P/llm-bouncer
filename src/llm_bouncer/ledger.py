@@ -172,6 +172,10 @@ def _fold(state: dict, row: dict, evicted: Optional[List[str]] = None) -> None:
     if row.get("event") == "review":
         state["reviewed_turn"] = max(int(state.get("reviewed_turn", 0)), turn)
         return
+    if row.get("event") == "grant":
+        grants = state.setdefault("grants", [])
+        grants.extend(g for g in row.get("grants") or [] if isinstance(g, str) and g not in grants)
+        return
     stype = str(row.get("source_type"))
     if row.get("taints") and stype not in state["taints"]:
         state["taints"].append(stype)
@@ -364,6 +368,65 @@ def record_review(session_id: str) -> dict:
     return state
 
 
+def record_grants(session_id: str, grants: List[str], source: str) -> dict:
+    """Capabilities for this session (from a typed prompt or `llm-bouncer grant --session`)."""
+    with _locked(session_id):
+        state = read_state(session_id)
+        state["turn"] = int(state["turn"]) + 1
+        row = {"event": "grant", "session_id": session_id, "turn": state["turn"], "grants": list(grants),
+               "source": source, "ts": time.time()}
+        _add_row(session_id, state, row, [])
+        state["ledger_bytes"] = _size(ledger_path(session_id))
+        _write_atomic(_state_path(session_id), state)
+    return state
+
+
+def recent_states(minutes: float) -> Dict[str, dict]:
+    """Summaries of sessions written to in the last `minutes` (for the egress proxy)."""
+    d = ledger_dir()
+    cutoff = time.time() - minutes * 60
+    out: Dict[str, dict] = {}
+    if not d.exists():
+        return out
+    for p in d.glob("*.state.json"):
+        try:
+            if p.stat().st_mtime < cutoff:
+                continue
+            st = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(st, dict) and isinstance(st.get("sources"), dict):
+            out[p.name[: -len(".state.json")]] = st
+    return out
+
+
+def global_grants_path() -> Path:
+    return ledger_dir() / "grants.json"
+
+
+def global_grants(now: Optional[float] = None) -> List[str]:
+    """Unexpired grants made with `llm-bouncer grant` (no --session)."""
+    now = time.time() if now is None else now
+    try:
+        rows = json.loads(global_grants_path().read_text(encoding="utf-8")).get("grants", [])
+    except (OSError, ValueError, AttributeError):
+        return []
+    return [r["target"] for r in rows if isinstance(r, dict) and r.get("expires", 0) > now and isinstance(r.get("target"), str)]
+
+
+def add_global_grants(targets: List[str], hours: float) -> None:
+    _ensure_dir()
+    with _locked("_grants"):
+        now = time.time()
+        try:
+            rows = json.loads(global_grants_path().read_text(encoding="utf-8")).get("grants", [])
+        except (OSError, ValueError, AttributeError):
+            rows = []
+        rows = [r for r in rows if isinstance(r, dict) and r.get("expires", 0) > now and r.get("target") not in targets]
+        rows += [{"target": t, "expires": now + hours * 3600} for t in targets]
+        _write_atomic(global_grants_path(), {"grants": rows})
+
+
 def _append_text(path: Path, text: str) -> None:
     fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
     try:
@@ -418,7 +481,7 @@ def sessions() -> List[str]:
 
 _OWN_FILE = re.compile(
     r"^(?:[A-Za-z0-9_.-]+\.(?:jsonl|decisions\.jsonl|state\.json|lock|hashes|dirty)"
-    r"|policy\.cache\.json|\.[A-Za-z0-9_.-]+\.\d+\.tmp|\.policy\.cache\.\d+\.tmp)$"
+    r"|policy\.cache\.json|grants\.json|egress\.log|[A-Za-z0-9_.-]+\.snap\.json|\.[A-Za-z0-9_.-]+\.\d+\.tmp|\.policy\.cache\.\d+\.tmp)$"
 )
 
 

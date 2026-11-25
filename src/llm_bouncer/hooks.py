@@ -7,6 +7,11 @@ Claude Code runs a hook as a command, passes JSON on stdin, and reads JSON from 
     llm-bouncer pre-tool-use      # PreToolUse: allow, ask or deny the next tool call
     llm-bouncer show [SESSION_ID] # list sessions, or print one session's ledger
     llm-bouncer review SESSION_ID # you checked the session: content read so far stops tainting it
+    llm-bouncer grant TARGET... [--session ID] [--hours N]  # allow an effect after untrusted content
+                                  # TARGET: a host (pypi.org, *.npmjs.org), write:PATH, read:PATH, mcp:TOOL
+    llm-bouncer grants [SESSION_ID]   # list active grants
+    llm-bouncer proxy [--port N]  # the egress proxy for Claude Code's sandbox (see `setup`)
+    llm-bouncer setup             # print the sandbox settings that turn on the effects gate
     llm-bouncer eval [PATH] [--policy FILE] [--json] [--check]  # score the gate on attack/harmless scenarios
 
 Set LLM_BOUNCER_MODE=monitor to log pre-tool-use decisions without enforcing them.
@@ -24,7 +29,7 @@ import sys
 import time
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
-from . import indicators, ledger, policy
+from . import effects, indicators, integrity, ledger, policy
 from .labels import Label, SourceType, digest, source_for_tool, trust_for
 from .scan import scan_text
 from .textnorm import one_line
@@ -189,7 +194,7 @@ def decide_tool_call(event: dict) -> policy.Decision:
         if src:
             src["url_h"] = list(src.get("url_h", [])) + list(kinds["u"])
             src["email_h"] = list(src.get("email_h", [])) + list(kinds["e"])
-    return policy.decide_from_state(str(event.get("tool_name", "")), event.get("tool_input"), state, policy.load_policy())
+    return effects.decide(event, state, policy.load_policy())
 
 
 def _emit_decision(decision: policy.Decision) -> None:
@@ -291,23 +296,95 @@ def _cmd_post_tool_use(args: List[str]) -> int:
     label, first, tainting = _save(label)
     if error is not None:
         raise error
-    _emit("PostToolUse", build_note(label, first_of_source=first, tainting=tainting))
+    note = build_note(label, first_of_source=first, tainting=tainting)
+    if event.get("tool_name") == "Bash":
+        note = " ".join(p for p in (note, _after_sandboxed_bash(event)) if p)
+    _emit("PostToolUse", note)
     return 0
+
+
+def _after_sandboxed_bash(event: dict) -> str:
+    """Revert unapproved integrity changes and report blocked connections (effects gate)."""
+    sid = str(event.get("session_id", "unknown"))
+    pol = policy.load_policy()
+    grants = effects.session_grants(ledger.read_state(sid))
+    reverted, stuck, since = integrity.check_and_revert(
+        sid, event.get("tool_use_id"), lambda rel: effects.path_granted(rel, grants, "write"), pol.get("integrity_paths") or [])
+    if not since:
+        return ""
+    parts = []
+    if reverted:
+        parts.append(f"reverted changes to {', '.join(reverted[:5])}: they decide what runs later and this session read "
+                     "untrusted content. If the user asked for this, they can run `llm-bouncer grant write:PATH` and you can retry.")
+    if stuck:
+        parts.append(f"could not revert changes to {', '.join(stuck[:5])}; tell the user.")
+    blocked = _blocked_hosts(since)
+    if blocked:
+        parts.append(f"blocked connections to {', '.join(blocked[:5])} after untrusted content. Tell the user; if they asked "
+                     f"for it they can run `llm-bouncer grant {blocked[0]}` and you can retry.")
+    return ("[llm-bouncer] " + " ".join(parts)) if parts else ""
+
+
+def _blocked_hosts(since: float) -> List[str]:
+    path = ledger.ledger_dir() / "egress.log"
+    try:
+        with path.open("rb") as fh:
+            fh.seek(max(0, path.stat().st_size - 256 * 1024))
+            tail = fh.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return []
+    hosts: List[str] = []
+    for line in tail:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict) and row.get("action") == "deny" and float(row.get("ts", 0)) >= since and row.get("host") not in hosts:
+            hosts.append(str(row.get("host")))
+    return hosts
 
 
 def _cmd_user_prompt(args: List[str]) -> int:
     event = _read_event()
     _check_ledger_vanished(event)
     label, _, _ = _save(label_user_prompt(event))
+    pol = policy.load_policy()
+    if not label.flags:  # a prompt with hidden content may be pasted attacker text: it grants nothing
+        grants = effects.grants_from_prompt(str(event.get("prompt", "")), pol, event.get("cwd"))
+        if grants:
+            ledger.record_grants(label.session_id, grants, "prompt")
+    _ensure_proxy(event, pol)
     _emit("UserPromptSubmit", build_note(label))
     return 0
+
+
+def _ensure_proxy(event: dict, pol: dict) -> None:
+    """Start the egress proxy if the sandbox is set to use it and nothing is listening."""
+    sb = effects.sandbox_settings(event.get("cwd"))
+    port = int((pol.get("egress") or {}).get("proxy_port", 18877))
+    net = sb.get("network") if isinstance(sb.get("network"), dict) else {}
+    if not sb.get("enabled") or net.get("httpProxyPort") != port:
+        return
+    from . import proxy  # asyncio is only imported when the effects gate is configured
+
+    if proxy.is_running(port):
+        return
+    import subprocess
+
+    subprocess.Popen([sys.executable, "-m", "llm_bouncer.hooks", "proxy", "--port", str(port)],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 
 
 def _cmd_pre_tool_use(args: List[str]) -> int:
     event = _read_event()
     decision = decide_tool_call(event)
     mode = os.environ.get("LLM_BOUNCER_MODE", "enforce")
-    if decision.action != policy.ALLOW or decision.risk:
+    if decision.risk == ["sandboxed"]:
+        sid = str(event.get("session_id", "unknown"))
+        pol = policy.load_policy()
+        if policy.session_status(ledger.read_state(sid), pol)[0] == policy.TAINTED:
+            integrity.snapshot(sid, event.get("tool_use_id"), str(event.get("cwd") or os.getcwd()), pol.get("integrity_paths") or [])
+    elif decision.action != policy.ALLOW or decision.risk:
         ledger.append_decision(
             str(event.get("session_id", "unknown")),
             {
@@ -343,6 +420,47 @@ def _cmd_review(args: List[str]) -> int:
     return 0
 
 
+def _cmd_grant(args: List[str]) -> int:
+    session, hours, targets = None, None, []
+    it = iter(args)
+    for a in it:
+        if a == "--session":
+            session = next(it, None)
+        elif a == "--hours":
+            hours = float(next(it, "8"))
+        else:
+            targets.append(a if ":" in a and a.split(":", 1)[0] in ("egress", "write", "read", "mcp") else "egress:" + a)
+    if not targets:
+        print("usage: llm-bouncer grant TARGET... [--session SESSION_ID] [--hours N]", file=sys.stderr)
+        return 2
+    if session:
+        ledger.record_grants(session, targets, "cli")
+        print(f"granted for session {session}: {', '.join(targets)}")
+    else:
+        h = hours if hours is not None else float((policy.load_policy().get("egress") or {}).get("grant_hours", 8))
+        ledger.add_global_grants(targets, h)
+        print(f"granted for {h:g} hours: {', '.join(targets)}")
+    return 0
+
+
+def _cmd_grants(args: List[str]) -> int:
+    for g in ledger.global_grants():
+        print(f"global   {g}")
+    if args:
+        for g in ledger.read_state(args[0]).get("grants") or []:
+            print(f"session  {g}")
+    return 0
+
+
+def _cmd_setup(args: List[str]) -> int:
+    port = int((policy.load_policy().get("egress") or {}).get("proxy_port", 18877))
+    print("Add this to ~/.claude/settings.json (merge with your existing \"sandbox\" and \"hooks\" keys):\n")
+    print(json.dumps({"sandbox": {"enabled": True, "network": {"httpProxyPort": port, "socksProxyPort": port + 1}}}, indent=2))
+    print("\nThe user-prompt hook starts the proxy when needed; or run `llm-bouncer proxy` yourself.")
+    print("Sandboxed Bash calls then run without command rules; llm-bouncer decides their network and file effects.")
+    return 0
+
+
 def _cmd_show(args: List[str]) -> int:
     if not args:
         for sid in ledger.sessions():
@@ -368,8 +486,13 @@ def main(argv: Optional[list] = None) -> int:
         from .evals import runner
 
         return runner.main(args[1:])
-    if cmd == "review":  # a command for people: errors should be seen, not swallowed
-        return _cmd_review(args[1:])
+    people = {"review": _cmd_review, "grant": _cmd_grant, "grants": _cmd_grants, "setup": _cmd_setup}
+    if cmd in people:  # commands for people: errors should be seen, not swallowed
+        return people[cmd](args[1:])
+    if cmd == "proxy":
+        from . import proxy
+
+        return proxy.main(args[1:])
     handler = _HOOKS.get(cmd)
     if handler is None:
         print(__doc__, file=sys.stderr)

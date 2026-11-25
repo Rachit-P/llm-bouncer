@@ -4,7 +4,22 @@
 
 AI agents read a lot of text they did not write: web pages, files, command output, MCP tool results. Any of it can contain hidden instructions. `llm-bouncer` keeps a record of *what* the agent read and *where it came from*, and checks every tool call against that record before it runs.
 
-> **Status: v0.6.0.** Labelling (v0), a pre-tool-use gate (v1) and an evaluation kit. Every decision comes from fixed rules, not from a model.
+> **Status: v0.7.0.** Labelling, a pre-tool-use gate, an evaluation kit and, new, an **effects gate**: with Claude Code's sandbox on, shell commands run freely and llm-bouncer mediates what they *do* (network, files that run code later) instead of guessing from what they *say*. Every decision comes from fixed rules, not from a model.
+
+## The effects gate (recommended)
+
+A shell can spell anything, so judging commands by their text never ends. An injected agent can only hurt you through a few effects: data leaving the machine, writes to files that run code later, secret reads, and acting as you. With the effects gate:
+
+- **Any sandboxed Bash command runs.** `make docs`, `jq … > out.json`, `$(…)` and scripts no longer prompt.
+- **After untrusted content, every network connection needs a capability.** `llm-bouncer proxy` is the sandbox's network proxy; it blocks hosts nobody granted, before DNS, however the command was spelled.
+- **Changes to CI, build and test-setup files are reverted** unless granted (Claude Code's sandbox already protects `.claude/`, `.git/hooks`, `.git/config` and rc files).
+- **Capabilities come only from you**: your typed prompt ("install requests" grants the package registries, "push" your git remotes, a URL you type its host) or `llm-bouncer grant HOST|write:PATH|mcp:TOOL`.
+
+```bash
+llm-bouncer setup     # prints the sandbox settings to add to ~/.claude/settings.json
+```
+
+On the eval, harmless tasks stopped for any reason fall from 8 of 19 to 4 of 19 (each fixed with one `grant`), and attacks blocked outright rise from 28% to 67%. Design, numbers and limits: [docs/effects.md](docs/effects.md). Without the sandbox, the command rules below apply as before.
 
 ## What it does
 
@@ -104,7 +119,10 @@ llm-bouncer eval                                     # table + summary
 llm-bouncer eval --policy examples/policy.strict.yaml  # compare another policy
 llm-bouncer eval my_cases.yaml --json                # your own scenarios
 llm-bouncer eval --check                             # exit 1 if results drift (CI)
+llm-bouncer eval --gate both                         # command rules vs the effects gate
 ```
+
+The table below is the command gate. For the effects gate (attacks caught 39 / 43, blocked outright 29 / 43, harmless asked 0 / 19, harmless blocked until granted 4 / 19), see [docs/effects.md](docs/effects.md).
 
 | Policy | Attacks caught (deny or ask) | Blocked outright | Harmless calls asked | Harmless calls blocked |
 |---|---|---|---|---|
@@ -140,9 +158,10 @@ The asked rate on harmless work after reading the web rose to 37% with allowlist
 2. **v1:** pre-tool-use gate with risky-action rules, echo check, editable policy and monitor mode.
 3. **v1 eval kit:** replayed attack and harmless scenarios, catch and false-alarm rates, policy comparison.
 4. **v0.5:** allowlist mode after untrusted content, fail-closed labelling, tamper detection, red-team scenarios.
-5. **v0.6 (this release):** explicit session states: sticky tamper detection, fail-closed storage, monotonic taint with `review`, overflow store for echo hashes.
-6. **Next:** live runs against real models (how often each one is fooled, with and without llm-bouncer).
-7. Pasted-text labelling, plug-in detectors, adapters for other agent frameworks.
+5. **v0.6:** explicit session states: sticky tamper detection, fail-closed storage, monotonic taint with `review`, overflow store for echo hashes.
+6. **v0.7 (this release):** the effects gate: sandboxed commands run, an egress proxy and integrity revert mediate their effects, capabilities from the typed prompt or `grant`.
+7. **Next:** live runs against real models (how often each one is fooled, with and without llm-bouncer).
+8. Pasted-text labelling, plug-in detectors, adapters for other agent frameworks.
 
 ## Development
 
