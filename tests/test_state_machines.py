@@ -146,7 +146,7 @@ def test_review_clears_taint_until_new_untrusted_content(monkeypatch, capsys):
     _poison(monkeypatch, capsys)
     assert policy.session_status(ledger.read_state(SID), policy.load_policy())[0] == policy.TAINTED
     assert hooks.main(["review", SID]) == 0
-    assert "marked reviewed" in capsys.readouterr().out
+    assert "Marked reviewed" in capsys.readouterr().out
     assert policy.session_status(ledger.read_state(SID), policy.load_policy())[0] == policy.REVIEWED
     assert _pre("Bash", CURL, monkeypatch, capsys) == "allow"
     _post("WebFetch", {"url": "https://second.example"}, {"result": "more"}, monkeypatch, capsys)

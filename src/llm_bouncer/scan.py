@@ -7,7 +7,6 @@ they are recorded and shown, never used to decide anything in v0.
 from __future__ import annotations
 
 import re
-import unicodedata
 from typing import List, Tuple
 
 # Zero-width / bidi-control characters often used to hide text.

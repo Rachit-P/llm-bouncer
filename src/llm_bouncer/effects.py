@@ -24,12 +24,13 @@ import fnmatch
 import json
 import os
 import re
+import shlex
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlparse
 
-from . import ledger, policy
+from . import ledger, messages, policy
 from .policy import ALLOW, ASK, DENY, Decision
 
 EFFECTS, COMMANDS = "effects", "commands"
@@ -92,8 +93,12 @@ def proxy_port(pol: Dict[str, Any]) -> int:
     return int((pol.get("egress") or {}).get("proxy_port", 18877))
 
 
-def proxy_configured(cwd: Optional[str], pol: Dict[str, Any]) -> bool:
-    """Is the sandbox on, with every sandboxed connection going through llm-bouncer's proxy?
+def _shown(value: Any) -> str:
+    return "not set" if value is None else repr(value)
+
+
+def sandbox_problems(cwd: Optional[str], pol: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """Why sandboxed Bash would not be contained by llm-bouncer: [(problem, fix)]; empty = contained.
 
     Both ports must be ours: a SOCKS port left to Claude Code's built-in proxy would be a second,
     taint-blind way out. The ledger must also be out of reach of sandboxed commands, which may
@@ -101,18 +106,33 @@ def proxy_configured(cwd: Optional[str], pol: Dict[str, Any]) -> bool:
     """
     sb = sandbox_settings(cwd)
     net = sb.get("network") if isinstance(sb.get("network"), dict) else {}
-    port = proxy_port(pol)
-    if not sb.get("enabled") or net.get("httpProxyPort") != port or net.get("socksProxyPort") != port + 1:
-        return False
     fs = sb.get("filesystem") if isinstance(sb.get("filesystem"), dict) else {}
+    port = proxy_port(pol)
+    out: List[Tuple[str, str]] = []
+    if (pol.get("gate") or "auto") == COMMANDS:
+        out.append(("the policy sets `gate: commands`", "remove `gate: commands` from your policy file"))
+    if not sb.get("enabled"):
+        out.append(("the sandbox is off", 'set "sandbox": {"enabled": true} (see `llm-bouncer setup`)'))
+    if net.get("httpProxyPort") != port:
+        out.append((f"sandbox.network.httpProxyPort is {_shown(net.get('httpProxyPort'))}, not {port}",
+                    f'set "httpProxyPort": {port}'))
+    if net.get("socksProxyPort") != port + 1:
+        out.append((f"sandbox.network.socksProxyPort is {_shown(net.get('socksProxyPort'))}, not {port + 1}",
+                    f'set "socksProxyPort": {port + 1}'))
     if fs.get("disabled"):
-        return False
+        out.append(("sandbox.filesystem is disabled", 'remove "disabled" from sandbox.filesystem'))
     root, ledger_dir = project_root(cwd), ledger.ledger_dir().resolve()
     if ledger_dir == root or root in ledger_dir.parents:
         denied = [Path(os.path.expanduser(str(p))).resolve() for p in fs.get("denyWrite") or []]
         if not any(d == ledger_dir or d in ledger_dir.parents for d in denied):
-            return False
-    return True
+            out.append((f"the ledger ({ledger_dir}) is inside the project and sandboxed commands can write it",
+                        f'add "{ledger_dir}" to sandbox.filesystem.denyWrite'))
+    return out
+
+
+def proxy_configured(cwd: Optional[str], pol: Dict[str, Any]) -> bool:
+    """Is the sandbox on, with every sandboxed connection going through llm-bouncer's proxy?"""
+    return not [p for p in sandbox_problems(cwd, pol) if not p[0].startswith("the policy sets")]
 
 
 _SEGMENT = re.compile(r"\s*(?:&&|\|\||[;|&\n])\s*")
@@ -279,7 +299,7 @@ def egress_decision(host: str, url: Optional[str], states: Dict[str, dict], pol:
     eg = pol.get("egress") or {}
     host = _host(host)
     if any(fnmatch.fnmatchcase(host, _host(p)) for p in eg.get("always_deny") or []):
-        return Decision(DENY, f"llm-bouncer: {host} is in egress.always_deny.", ["egress"])
+        return Decision(DENY, f"llm-bouncer: {host} is in egress.always_deny in your policy. [risk: egress]", ["egress"])
     if any(fnmatch.fnmatchcase(host, _host(p)) for p in eg.get("always_allow") or []):
         return Decision(ALLOW)
     tainted: List[dict] = []
@@ -291,21 +311,15 @@ def egress_decision(host: str, url: Optional[str], states: Dict[str, dict], pol:
     if not tainted:
         return Decision(ALLOW)
     if url and policy.looks_secret(url, pol):
-        return Decision(DENY, f"llm-bouncer: request to {host} carries something that looks like a secret.",
+        return Decision(DENY, f"llm-bouncer: blocked a request to {host}: its URL carries something that looks like "
+                        "a secret, and this session has read untrusted content. [risk: egress, secret_in_url]",
                         ["egress", "secret_in_url"])
     if host_granted(host, strong):
         return Decision(ALLOW, risk=["egress", "granted"])
     untrusted_from = {h for v in tainted for h in v.get("hosts", [])}
     if host_granted(host, prompt) and host not in untrusted_from:
         return Decision(ALLOW, risk=["egress", "granted"])
-    origins = ", ".join(dict.fromkeys(o for v in tainted for o in v.get("origins", [])[-2:]))
-    why = " (it is also where the untrusted content came from)" if host in untrusted_from else ""
-    return Decision(
-        DENY,
-        f"llm-bouncer: blocked a connection to {host}{why} after untrusted content ({origins[:200]}). "
-        f"If you asked for it, run: llm-bouncer grant {host}",
-        ["egress"],
-    )
+    return Decision(DENY, messages.egress_reason(host, tainted, host in untrusted_from), ["egress"])
 
 
 # ---------------------------------------------------------------- the hook gate
@@ -340,12 +354,39 @@ def decide(event: dict, state: Dict[str, Any], pol: Dict[str, Any]) -> Decision:
     ti = event.get("tool_input")
     if tool == "Bash" and gate_mode(event, pol) == EFFECTS:
         if "bouncer_tamper" in policy.classify(tool, ti, pol):
-            return Decision(ASK, "llm-bouncer: touches llm-bouncer itself. Approve only if you asked.", ["bouncer_tamper"])
+            return Decision(ASK, messages.tamper_reason(["bouncer_tamper"]), ["bouncer_tamper"])
         # Runs in the sandbox: egress is decided by the proxy, writes by the sandbox and the
         # integrity snapshot. Nothing to predict from the command text.
         return Decision(ALLOW, risk=["sandboxed"])
     d = policy.decide_from_state(tool, ti, state, pol)
-    if d.action == ASK and "bouncer_tamper" not in d.risk and \
-            _covered(tool, ti if isinstance(ti, dict) else {}, d.risk, session_grants(state)):
-        return Decision(ALLOW, risk=d.risk + ["granted"])
+    tid = ti if isinstance(ti, dict) else {}
+    if d.action == ASK and "bouncer_tamper" not in d.risk:
+        if _covered(tool, tid, d.risk, session_grants(state)):
+            return Decision(ALLOW, risk=d.risk + ["granted"])
+        hint = grant_hint(tool, tid, d.risk, event.get("cwd"))
+        if hint:
+            d.reason = messages.with_grant_hint(d.reason, f"{hint} --session {event.get('session_id', 'SESSION_ID')}")
     return d
+
+
+def grant_hint(tool: str, tool_input: Dict[str, Any], risks: List[str], cwd: Optional[str]) -> Optional[str]:
+    """The grant that would cover this call, if one can (see _COVERS); None otherwise."""
+    targets = []
+    for r in risks:
+        if r not in _COVERS:
+            return None
+        kind, keys = _COVERS[r]
+        if kind == "mcp":
+            targets.append(f"mcp:{tool}")
+            continue
+        path = next((str(tool_input[k]) for k in keys if tool_input.get(k)), "")
+        if not path:
+            return None
+        p = Path(os.path.expanduser(path))
+        try:
+            p = (p if p.is_absolute() else Path(cwd or ".") / p).resolve()
+            path = p.relative_to(project_root(cwd)).as_posix()
+        except (ValueError, OSError):
+            pass
+        targets.append(shlex.quote(f"{kind}:{path}"))
+    return " ".join(dict.fromkeys(targets)) or None

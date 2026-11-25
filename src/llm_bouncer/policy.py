@@ -13,7 +13,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 from urllib.parse import parse_qsl, urlparse
 
-from .textnorm import key_hash, norm, one_line, url_keys
+from . import messages
+from .textnorm import key_hash, norm, url_keys
 
 ALLOW, ASK, DENY = "allow", "ask", "deny"
 _ACTIONS = (ALLOW, ASK, DENY)
@@ -469,7 +470,7 @@ def decide_from_state(tool_name: str, tool_input: Any, state: Dict[str, Any], po
     _, tainted = session_status(state, policy)
     if not tainted:
         if always:
-            return Decision(ASK, f"llm-bouncer: touches llm-bouncer itself ({', '.join(sorted(always))}). Approve only if you asked.", risks)
+            return Decision(ASK, messages.tamper_reason(risks), risks)
         return Decision(ALLOW, risk=risks)
     if risks:
         why, knob = risks, "on_risky_after_taint"
@@ -478,13 +479,11 @@ def decide_from_state(tool_name: str, tool_input: Any, state: Dict[str, Any], po
         if unlisted is None:
             return Decision(ALLOW)
         why, knob = [unlisted], "on_unlisted_after_taint"
-    origins = ", ".join(dict.fromkeys(one_line(o, 60) for v in tainted for o in v.get("origins", [])[-2:]))
     echoes = find_echoes(tool_input, tainted)
     if echoes:
-        reason = f"llm-bouncer: {', '.join(why)} repeats untrusted text (\"{one_line(echoes[0], 80)}\") from {origins}."
-        return Decision(policy.get("on_echo", DENY), reason, why, echoes)
+        action = policy.get("on_echo", DENY)
+        return Decision(action, messages.echo_reason(why, echoes[0], tainted, action == DENY), why, echoes)
     action = policy.get(knob, ASK)
     if action == ALLOW and always:
         action = ASK
-    reason = f"llm-bouncer: {', '.join(why)} after reading untrusted content ({origins}). Approve only if you asked."
-    return Decision(action, reason, why)
+    return Decision(action, messages.ask_reason(why, tainted), why)
