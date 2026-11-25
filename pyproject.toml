@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "llm-bouncer"
-version = "0.7.0"
+version = "0.7.1"
 description = "Text labelling for LLM agents: records where every piece of text an agent reads came from."
 readme = "README.md"
 requires-python = ">=3.11"

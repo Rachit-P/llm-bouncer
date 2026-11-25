@@ -14,8 +14,8 @@ writes. After untrusted content an effect needs a capability ("grant"). Capabili
 the trusted channel: the developer's typed prompt (see `intents` in the policy) or
 `llm-bouncer grant`. Untrusted text can supply data, never capabilities.
 
-Calls that run outside the sandbox (no sandbox, unsandboxed retries, excludedCommands) fall back to
-the command rules in policy.py, because there nothing contains the effects.
+Calls the sandbox cannot contain (no sandbox, unsandboxed retries, excludedCommands, background
+commands) fall back to the command rules in policy.py.
 """
 
 from __future__ import annotations
@@ -33,6 +33,28 @@ from . import ledger, policy
 from .policy import ALLOW, ASK, DENY, Decision
 
 EFFECTS, COMMANDS = "effects", "commands"
+GRANT_KINDS = ("egress", "write", "read", "mcp")
+
+
+# ---------------------------------------------------------------- where the project is
+
+
+def project_root(cwd: Optional[str]) -> Path:
+    """The project Claude Code runs in, even when a hook's cwd is a subfolder.
+
+    $CLAUDE_PROJECT_DIR when the cwd is inside it, else the nearest folder above the cwd that
+    holds `.claude` or `.git`, else the cwd.
+    """
+    here = Path(cwd or os.getcwd()).resolve()
+    env = os.environ.get("CLAUDE_PROJECT_DIR")
+    if env:
+        root = Path(env).resolve()
+        if here == root or root in here.parents:
+            return root
+    for d in (here, *here.parents):
+        if (d / ".claude").is_dir() or (d / ".git").exists():
+            return d
+    return here
 
 
 # ---------------------------------------------------------------- sandbox detection
@@ -48,50 +70,92 @@ def _read_json(path: Path) -> dict:
 
 def sandbox_settings(cwd: Optional[str]) -> dict:
     """The merged `sandbox` settings Claude Code would use (user, then project, then local)."""
-    files = [Path.home() / ".claude" / "settings.json"]
-    if cwd:
-        files += [Path(cwd) / ".claude" / "settings.json", Path(cwd) / ".claude" / "settings.local.json"]
+    root = project_root(cwd)
+    files = [Path.home() / ".claude" / "settings.json", root / ".claude" / "settings.json",
+             root / ".claude" / "settings.local.json"]
     merged: Dict[str, Any] = {}
     for f in files:
         sb = _read_json(f).get("sandbox")
-        if isinstance(sb, dict):
-            for k, v in sb.items():
-                if isinstance(v, dict) and isinstance(merged.get(k), dict):
-                    merged[k] = {**merged[k], **v}
-                elif isinstance(v, list) and isinstance(merged.get(k), list):
-                    merged[k] = merged[k] + v
-                else:
-                    merged[k] = v
+        if not isinstance(sb, dict):
+            continue
+        for k, v in sb.items():
+            if isinstance(v, dict) and isinstance(merged.get(k), dict):
+                merged[k] = {**merged[k], **v}
+            elif isinstance(v, list) and isinstance(merged.get(k), list):
+                merged[k] = merged[k] + v
+            else:
+                merged[k] = v
     return merged
 
 
-def runs_sandboxed(event: dict, pol: Dict[str, Any]) -> bool:
-    """Will this Bash call run in the sandbox, behind llm-bouncer's proxy?
+def proxy_port(pol: Dict[str, Any]) -> int:
+    return int((pol.get("egress") or {}).get("proxy_port", 18877))
 
-    Any doubt means no: the command rules then apply, as before v0.7. A repository's settings can
-    only push a call towards the stricter command rules (turn the sandbox off, exclude commands,
-    change the proxy port), never towards the effects gate.
+
+def proxy_configured(cwd: Optional[str], pol: Dict[str, Any]) -> bool:
+    """Is the sandbox on, with every sandboxed connection going through llm-bouncer's proxy?
+
+    Both ports must be ours: a SOCKS port left to Claude Code's built-in proxy would be a second,
+    taint-blind way out. The ledger must also be out of reach of sandboxed commands, which may
+    write anywhere in the project: otherwise a command could edit its own grants.
     """
-    ti = event.get("tool_input") if isinstance(event.get("tool_input"), dict) else {}
-    if ti.get("dangerouslyDisableSandbox"):
-        return False
-    sb = sandbox_settings(event.get("cwd"))
-    if not sb.get("enabled"):
-        return False
+    sb = sandbox_settings(cwd)
     net = sb.get("network") if isinstance(sb.get("network"), dict) else {}
-    if net.get("httpProxyPort") != int((pol.get("egress") or {}).get("proxy_port", 0)):
+    port = proxy_port(pol)
+    if not sb.get("enabled") or net.get("httpProxyPort") != port or net.get("socksProxyPort") != port + 1:
         return False
-    cmd = str(ti.get("command", ""))
-    for pat in sb.get("excludedCommands") or []:
-        if isinstance(pat, str) and (fnmatch.fnmatchcase(cmd, pat) or fnmatch.fnmatchcase(cmd.split(" ")[0], pat)):
+    fs = sb.get("filesystem") if isinstance(sb.get("filesystem"), dict) else {}
+    if fs.get("disabled"):
+        return False
+    root, ledger_dir = project_root(cwd), ledger.ledger_dir().resolve()
+    if ledger_dir == root or root in ledger_dir.parents:
+        denied = [Path(os.path.expanduser(str(p))).resolve() for p in fs.get("denyWrite") or []]
+        if not any(d == ledger_dir or d in ledger_dir.parents for d in denied):
             return False
     return True
 
 
+_SEGMENT = re.compile(r"\s*(?:&&|\|\||[;|&\n])\s*")
+
+
+def runs_sandboxed(event: dict, pol: Dict[str, Any]) -> bool:
+    """Will this Bash call run in the sandbox, behind llm-bouncer's proxy, so its effects can be checked?
+
+    Any doubt means no, and the command rules apply. A repository's settings can only push a call
+    towards the command rules (turn the sandbox off, exclude commands, change a port), never away.
+    """
+    ti = event.get("tool_input") if isinstance(event.get("tool_input"), dict) else {}
+    if ti.get("dangerouslyDisableSandbox") or ti.get("run_in_background"):
+        # Unsandboxed: nothing contains it. Background: it outlives the post-tool-use hook, so its
+        # writes cannot be checked when it ends.
+        return False
+    if not proxy_configured(event.get("cwd"), pol):
+        return False
+    cmd = str(ti.get("command", ""))
+    parts = [cmd] + [p for p in _SEGMENT.split(cmd) if p]
+    for pat in sandbox_settings(event.get("cwd")).get("excludedCommands") or []:
+        if not isinstance(pat, str):
+            continue
+        for part in parts:
+            if fnmatch.fnmatchcase(part, pat) or fnmatch.fnmatchcase(part.split(" ")[0], pat):
+                return False
+    return True
+
+
 def gate_mode(event: dict, pol: Dict[str, Any]) -> str:
-    mode = os.environ.get("LLM_BOUNCER_GATE") or pol.get("gate", "auto")
-    if mode in (EFFECTS, COMMANDS):
-        return mode
+    """effects or commands for this Bash call.
+
+    `gate: commands` in the policy turns the effects gate off. LLM_BOUNCER_GATE=effects (used by
+    `eval --gate effects`) skips the settings check but never treats an unsandboxed or background
+    call as contained.
+    """
+    if (pol.get("gate") or "auto") == COMMANDS:
+        return COMMANDS
+    if os.environ.get("LLM_BOUNCER_GATE") == EFFECTS:
+        ti = event.get("tool_input") if isinstance(event.get("tool_input"), dict) else {}
+        return COMMANDS if ti.get("dangerouslyDisableSandbox") or ti.get("run_in_background") else EFFECTS
+    if os.environ.get("LLM_BOUNCER_GATE") == COMMANDS:
+        return COMMANDS
     return EFFECTS if runs_sandboxed(event, pol) else COMMANDS
 
 
@@ -102,13 +166,26 @@ def _host(target: str) -> str:
     return target.lower().rstrip(".")
 
 
+def normalize_target(target: str) -> Optional[str]:
+    """`pypi.org`, `https://pypi.org/x`, `egress:*.npmjs.org`, `write:Makefile`... -> a grant, or None."""
+    target = target.strip()
+    kind, sep, rest = target.partition(":")
+    if sep and kind in GRANT_KINDS:
+        return f"{kind}:{rest}" if rest else None
+    if "://" in target:
+        host = urlparse(target).hostname
+        return f"egress:{host}" if host else None
+    if re.fullmatch(r"(\*\.)?[A-Za-z0-9.-]+", target):
+        return "egress:" + target
+    m = re.fullmatch(r"((?:\*\.)?[A-Za-z0-9.-]+):\d+", target) or re.fullmatch(r"\[?([0-9a-fA-F:]+)\]?", target)
+    return "egress:" + m.group(1) if m else None
+
+
 def host_granted(host: str, grants: Iterable[str]) -> bool:
     host = _host(host)
     for g in grants:
-        if g.startswith("egress:"):
-            pat = _host(g[len("egress:"):])
-            if fnmatch.fnmatchcase(host, pat) or host == pat:
-                return True
+        if g.startswith("egress:") and fnmatch.fnmatchcase(host, _host(g[len("egress:"):])):
+            return True
     return False
 
 
@@ -132,25 +209,27 @@ def tool_granted(tool_name: str, grants: Iterable[str]) -> bool:
 
 def _git_remote_hosts(cwd: Optional[str]) -> List[str]:
     try:
-        out = subprocess.run(["git", "-C", cwd or ".", "remote", "-v"], capture_output=True, text=True, timeout=3).stdout
+        out = subprocess.run(["git", "-C", str(project_root(cwd)), "remote", "-v"], capture_output=True, text=True,
+                             timeout=3).stdout
     except (OSError, subprocess.SubprocessError):
         return []
-    hosts = []
+    hosts: List[str] = []
     for line in out.splitlines():
         parts = line.split()
         if len(parts) < 2:
             continue
-        url = parts[1]
-        m = re.match(r"^[\w.+-]+@([^:/]+):", url)  # git@github.com:me/app.git
-        h = m.group(1) if m else (urlparse(url).hostname or "")
+        m = re.match(r"^[\w.+-]+@([^:/]+):", parts[1])  # git@github.com:me/app.git
+        h = (m.group(1) if m else (urlparse(parts[1]).hostname or "")).lower()
         if h and h not in hosts:
-            hosts.append(h.lower())
+            hosts.append(h)
     return hosts
 
 
-_DOMAIN = re.compile(r"\b((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:[a-z]{2,24}))\b", re.I)
-_FILE = re.compile(r"(?<![\w/.-])((?:[\w.-]+/)*[\w.-]+\.(?:ya?ml|json|toml|py|cfg|ini|lock|txt|md|rs|mk|sh|js|ts))\b|\b(Makefile|GNUmakefile|Dockerfile)\b")
-_NOT_HOST_SUFFIX = {"py", "md", "txt", "json", "yml", "yaml", "toml", "cfg", "ini", "lock", "js", "ts", "rs", "sh", "mk"}
+_DOMAIN = re.compile(r"(?<![\w@.-])((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24})(?![\w-])", re.I)
+_FILE = re.compile(r"(?<![\w/.-])((?:[\w.-]+/)*[\w.-]+\.(?:ya?ml|json|toml|py|cfg|ini|lock|txt|md|rs|mk|sh|js|ts))\b"
+                   r"|\b(Makefile|GNUmakefile|Dockerfile)\b")
+_NOT_TLD = {"py", "md", "txt", "json", "yml", "yaml", "toml", "cfg", "ini", "lock", "js", "ts", "rs", "sh", "mk", "html",
+            "css", "lock", "log", "csv", "xml", "sql", "go", "rb", "java", "kt", "swift", "c", "h", "cpp", "env"}
 
 
 def grants_from_prompt(prompt: str, pol: Dict[str, Any], cwd: Optional[str] = None) -> List[str]:
@@ -163,7 +242,7 @@ def grants_from_prompt(prompt: str, pol: Dict[str, Any], cwd: Optional[str] = No
 
     for m in _DOMAIN.finditer(prompt):
         dom = m.group(1).lower()
-        if dom.rsplit(".", 1)[-1] not in _NOT_HOST_SUFFIX:
+        if dom.rsplit(".", 1)[-1] not in _NOT_TLD:
             add("egress:" + dom)
     for m in _FILE.finditer(prompt):
         add("write:" + (m.group(1) or m.group(2)))
@@ -179,7 +258,8 @@ def grants_from_prompt(prompt: str, pol: Dict[str, Any], cwd: Optional[str] = No
 
 
 def session_grants(state: Dict[str, Any]) -> List[str]:
-    return list(state.get("grants") or []) + ledger.global_grants()
+    """Every capability this session holds (yours, your prompts', and global ones)."""
+    return list(state.get("grants") or []) + list(state.get("prompt_grants") or []) + ledger.global_grants()
 
 
 # ---------------------------------------------------------------- egress (used by the proxy)
@@ -191,6 +271,10 @@ def egress_decision(host: str, url: Optional[str], states: Dict[str, dict], pol:
     The proxy cannot tell which session a connection comes from, so it is conservative: if any
     recent session is tainted, connections need a capability from some recent session or a
     global grant. `url` is only known for plain-HTTP requests (HTTPS is not decrypted).
+
+    A host granted only by a prompt does not count if untrusted content was read *from* it:
+    "summarise https://blog.example/post" lets the agent read that page, not send your files
+    back to the site that wrote it. `llm-bouncer grant` overrides this.
     """
     eg = pol.get("egress") or {}
     host = _host(host)
@@ -198,21 +282,27 @@ def egress_decision(host: str, url: Optional[str], states: Dict[str, dict], pol:
         return Decision(DENY, f"llm-bouncer: {host} is in egress.always_deny.", ["egress"])
     if any(fnmatch.fnmatchcase(host, _host(p)) for p in eg.get("always_allow") or []):
         return Decision(ALLOW)
-    tainted, grants = [], list(ledger.global_grants())
+    tainted: List[dict] = []
+    strong, prompt = list(ledger.global_grants()), []
     for st in states.values():
-        status, srcs = policy.session_status(st, pol)
-        tainted += srcs
-        grants += st.get("grants") or []
+        tainted += policy.session_status(st, pol)[1]
+        strong += st.get("grants") or []
+        prompt += st.get("prompt_grants") or []
     if not tainted:
         return Decision(ALLOW)
     if url and policy.looks_secret(url, pol):
-        return Decision(DENY, f"llm-bouncer: request to {host} carries something that looks like a secret.", ["egress", "secret_in_url"])
-    if host_granted(host, grants):
-        return Decision(ALLOW, risk=["egress"])
+        return Decision(DENY, f"llm-bouncer: request to {host} carries something that looks like a secret.",
+                        ["egress", "secret_in_url"])
+    if host_granted(host, strong):
+        return Decision(ALLOW, risk=["egress", "granted"])
+    untrusted_from = {h for v in tainted for h in v.get("hosts", [])}
+    if host_granted(host, prompt) and host not in untrusted_from:
+        return Decision(ALLOW, risk=["egress", "granted"])
     origins = ", ".join(dict.fromkeys(o for v in tainted for o in v.get("origins", [])[-2:]))
+    why = " (it is also where the untrusted content came from)" if host in untrusted_from else ""
     return Decision(
         DENY,
-        f"llm-bouncer: blocked a connection to {host} after untrusted content ({origins[:200]}). "
+        f"llm-bouncer: blocked a connection to {host}{why} after untrusted content ({origins[:200]}). "
         f"If you asked for it, run: llm-bouncer grant {host}",
         ["egress"],
     )
@@ -220,37 +310,42 @@ def egress_decision(host: str, url: Optional[str], states: Dict[str, dict], pol:
 
 # ---------------------------------------------------------------- the hook gate
 
+# Which grant kind lifts an "ask" for each risk, and where the call names what it touches.
+_COVERS = {
+    "sensitive_file_write": ("write", ("file_path", "notebook_path")),
+    "secrets_read": ("read", ("file_path", "path", "notebook_path")),
+    "mcp_external_action": ("mcp", ()),
+    "mcp_tool_not_read_only": ("mcp", ()),
+}
+
+
+def _covered(tool: str, tool_input: Dict[str, Any], risks: List[str], grants: List[str]) -> bool:
+    for r in risks:
+        if r not in _COVERS:
+            return False  # data in a URL, unlisted commands...: no grant makes those safe
+        kind, keys = _COVERS[r]
+        if kind == "mcp":
+            if not tool_granted(tool, grants):
+                return False
+        else:
+            target = next((str(tool_input[k]) for k in keys if tool_input.get(k)), "")
+            if not target or not path_granted(target, grants, kind):
+                return False
+    return bool(risks)
+
 
 def decide(event: dict, state: Dict[str, Any], pol: Dict[str, Any]) -> Decision:
     """Pre-tool-use decision under the effects model."""
     tool = str(event.get("tool_name", ""))
     ti = event.get("tool_input")
     if tool == "Bash" and gate_mode(event, pol) == EFFECTS:
-        risks = policy.classify(tool, ti, pol)
-        if "bouncer_tamper" in risks:
+        if "bouncer_tamper" in policy.classify(tool, ti, pol):
             return Decision(ASK, "llm-bouncer: touches llm-bouncer itself. Approve only if you asked.", ["bouncer_tamper"])
         # Runs in the sandbox: egress is decided by the proxy, writes by the sandbox and the
         # integrity snapshot. Nothing to predict from the command text.
         return Decision(ALLOW, risk=["sandboxed"])
     d = policy.decide_from_state(tool, ti, state, pol)
-    if d.action != ASK or "bouncer_tamper" in d.risk:
-        return d
-    grants = session_grants(state)
-    if not grants:
-        return d
-    tin = ti if isinstance(ti, dict) else {}
-    covered = True
-    for r in d.risk:
-        if r == "sensitive_file_write":
-            covered &= path_granted(str(tin.get("file_path") or tin.get("notebook_path") or ""), grants, "write")
-        elif r == "secrets_read":
-            covered &= path_granted(str(tin.get("file_path") or tin.get("path") or ""), grants, "read")
-        elif r in ("mcp_external_action", "mcp_tool_not_read_only"):
-            covered &= tool_granted(tool, grants)
-        elif tool == "WebFetch" and r in ("data_in_url",):
-            covered = False  # a granted host does not make a data-carrying URL safe
-        else:
-            covered = False
-    if covered:
+    if d.action == ASK and "bouncer_tamper" not in d.risk and \
+            _covered(tool, ti if isinstance(ti, dict) else {}, d.risk, session_grants(state)):
         return Decision(ALLOW, risk=d.risk + ["granted"])
     return d

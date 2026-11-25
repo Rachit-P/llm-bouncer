@@ -4,7 +4,7 @@
 
 AI agents read a lot of text they did not write: web pages, files, command output, MCP tool results. Any of it can contain hidden instructions. `llm-bouncer` keeps a record of *what* the agent read and *where it came from*, and checks every tool call against that record before it runs.
 
-> **Status: v0.7.0.** Labelling, a pre-tool-use gate, an evaluation kit and, new, an **effects gate**: with Claude Code's sandbox on, shell commands run freely and llm-bouncer mediates what they *do* (network, files that run code later) instead of guessing from what they *say*. Every decision comes from fixed rules, not from a model.
+> **Status: v0.7.1.** Labelling, a pre-tool-use gate, an evaluation kit and, new, an **effects gate**: with Claude Code's sandbox on, shell commands run freely and llm-bouncer mediates what they *do* (network, files that run code later) instead of guessing from what they *say*. Every decision comes from fixed rules, not from a model.
 
 ## The effects gate (recommended)
 
@@ -112,7 +112,7 @@ A later `git push` in the same session gets `"ask"` instead, and `ls` passes thr
 
 ## Evaluation
 
-`llm-bouncer eval` replays bundled scenarios through the real hooks: each one is a short session (what the agent read, then one tool call) with the outcome the policy should give. 43 are attacks, including 5 **known gaps** the default policy misses on purpose, and 19 are normal work. The `rt-*` attacks come from a [red-team round](#red-team) against v0.4.1.
+`llm-bouncer eval` replays bundled scenarios through the real hooks: each one is a short session (what the agent read, then one tool call) with the outcome the policy should give. 44 are attacks, including 5 **known gaps** the default policy misses on purpose, and 19 are normal work. The `rt-*` attacks come from a [red-team round](#red-team) against v0.4.1.
 
 ```bash
 llm-bouncer eval                                     # table + summary
@@ -122,12 +122,12 @@ llm-bouncer eval --check                             # exit 1 if results drift (
 llm-bouncer eval --gate both                         # command rules vs the effects gate
 ```
 
-The table below is the command gate. For the effects gate (attacks caught 39 / 43, blocked outright 29 / 43, harmless asked 0 / 19, harmless blocked until granted 4 / 19), see [docs/effects.md](docs/effects.md).
+The table below is the command gate. For the effects gate (attacks caught 40 / 44, blocked outright 30 / 44, harmless asked 0 / 19, harmless blocked until granted 4 / 19), see [docs/effects.md](docs/effects.md).
 
 | Policy | Attacks caught (deny or ask) | Blocked outright | Harmless calls asked | Harmless calls blocked |
 |---|---|---|---|---|
-| default | 38 / 43 (88%) | 12 / 43 (28%) | 7 / 19 (37%) | 1 / 19 (5%) |
-| strict (`file` and `command` also taint) | 40 / 43 (93%) | 13 / 43 (30%) | 9 / 19 (47%) | 1 / 19 (5%) |
+| default | 39 / 44 (89%) | 13 / 44 (30%) | 7 / 19 (37%) | 1 / 19 (5%) |
+| strict (`file` and `command` also taint) | 41 / 44 (93%) | 14 / 44 (32%) | 9 / 19 (47%) | 1 / 19 (5%) |
 
 The one wrongly blocked harmless call is real: the developer asks to install Rust, the agent reads the official rustup page, and runs the exact command it shows. The echo rule cannot tell an official install command from a planted one. Scenario files live in [`src/llm_bouncer/evals/scenarios/`](src/llm_bouncer/evals/scenarios/); add a YAML file with the same shape to test your own.
 

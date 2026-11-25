@@ -182,7 +182,13 @@ def _tamper_label(sid: str) -> Label:
                  chars=0, sha256="", flags=["ledger_missing"])
 
 
-def decide_tool_call(event: dict) -> policy.Decision:
+def session_state(event: dict) -> dict:
+    """The session summary every gate decision is made from.
+
+    Includes what the summary alone does not show: a deleted ledger (recorded first), a label that
+    could not be saved, and echo hashes moved to the overflow file. Used for the decision and for
+    the integrity snapshot alike, so they can never disagree about whether the session is tainted.
+    """
     sid = str(event.get("session_id", "unknown"))
     _check_ledger_vanished(event)
     state = ledger.read_state(sid, persist=True)
@@ -194,7 +200,11 @@ def decide_tool_call(event: dict) -> policy.Decision:
         if src:
             src["url_h"] = list(src.get("url_h", [])) + list(kinds["u"])
             src["email_h"] = list(src.get("email_h", [])) + list(kinds["e"])
-    return effects.decide(event, state, policy.load_policy())
+    return state
+
+
+def decide_tool_call(event: dict, state: Optional[dict] = None) -> policy.Decision:
+    return effects.decide(event, session_state(event) if state is None else state, policy.load_policy())
 
 
 def _emit_decision(decision: policy.Decision) -> None:
@@ -359,12 +369,14 @@ def _cmd_user_prompt(args: List[str]) -> int:
 
 
 def _ensure_proxy(event: dict, pol: dict) -> None:
-    """Start the egress proxy if the sandbox is set to use it and nothing is listening."""
-    sb = effects.sandbox_settings(event.get("cwd"))
-    port = int((pol.get("egress") or {}).get("proxy_port", 18877))
-    net = sb.get("network") if isinstance(sb.get("network"), dict) else {}
-    if not sb.get("enabled") or net.get("httpProxyPort") != port:
+    """Start the egress proxy if the sandbox is set to use it and nothing is listening.
+
+    Without it, sandboxed commands simply cannot connect anywhere (fail closed), so this is about
+    usability, not safety. Called on each prompt and before each sandboxed command.
+    """
+    if not effects.proxy_configured(event.get("cwd"), pol):
         return
+    port = effects.proxy_port(pol)
     from . import proxy  # asyncio is only imported when the effects gate is configured
 
     if proxy.is_running(port):
@@ -377,13 +389,15 @@ def _ensure_proxy(event: dict, pol: dict) -> None:
 
 def _cmd_pre_tool_use(args: List[str]) -> int:
     event = _read_event()
-    decision = decide_tool_call(event)
+    state = session_state(event)
+    decision = decide_tool_call(event, state)
     mode = os.environ.get("LLM_BOUNCER_MODE", "enforce")
     if decision.risk == ["sandboxed"]:
-        sid = str(event.get("session_id", "unknown"))
         pol = policy.load_policy()
-        if policy.session_status(ledger.read_state(sid), pol)[0] == policy.TAINTED:
-            integrity.snapshot(sid, event.get("tool_use_id"), str(event.get("cwd") or os.getcwd()), pol.get("integrity_paths") or [])
+        _ensure_proxy(event, pol)
+        if policy.session_status(state, pol)[0] == policy.TAINTED:
+            integrity.snapshot(str(event.get("session_id", "unknown")), event.get("tool_use_id"),
+                               effects.project_root(event.get("cwd")), pol.get("integrity_paths") or [])
     elif decision.action != policy.ALLOW or decision.risk:
         ledger.append_decision(
             str(event.get("session_id", "unknown")),
@@ -402,80 +416,10 @@ def _cmd_pre_tool_use(args: List[str]) -> int:
     return 0
 
 
-def _cmd_review(args: List[str]) -> int:
-    if not args:
-        print("usage: llm-bouncer review SESSION_ID  (see `llm-bouncer show` for session ids)", file=sys.stderr)
-        return 2
-    sid = args[0]
-    pol = policy.load_policy()
-    status, tainted = policy.session_status(ledger.read_state(sid), pol)
-    if status != policy.TAINTED:
-        print(f"{sid}: {status}, nothing to review")
-        return 0
-    for stype, v in ledger.read_state(sid)["sources"].items():
-        if v in tainted:
-            print(f"  {stype}: {v.get('count')} item(s), e.g. {', '.join(v.get('origins', []))}")
-    ledger.record_review(sid)
-    print(f"{sid}: marked reviewed. Content read from now on taints the session again.")
-    return 0
-
-
-def _cmd_grant(args: List[str]) -> int:
-    session, hours, targets = None, None, []
-    it = iter(args)
-    for a in it:
-        if a == "--session":
-            session = next(it, None)
-        elif a == "--hours":
-            hours = float(next(it, "8"))
-        else:
-            targets.append(a if ":" in a and a.split(":", 1)[0] in ("egress", "write", "read", "mcp") else "egress:" + a)
-    if not targets:
-        print("usage: llm-bouncer grant TARGET... [--session SESSION_ID] [--hours N]", file=sys.stderr)
-        return 2
-    if session:
-        ledger.record_grants(session, targets, "cli")
-        print(f"granted for session {session}: {', '.join(targets)}")
-    else:
-        h = hours if hours is not None else float((policy.load_policy().get("egress") or {}).get("grant_hours", 8))
-        ledger.add_global_grants(targets, h)
-        print(f"granted for {h:g} hours: {', '.join(targets)}")
-    return 0
-
-
-def _cmd_grants(args: List[str]) -> int:
-    for g in ledger.global_grants():
-        print(f"global   {g}")
-    if args:
-        for g in ledger.read_state(args[0]).get("grants") or []:
-            print(f"session  {g}")
-    return 0
-
-
-def _cmd_setup(args: List[str]) -> int:
-    port = int((policy.load_policy().get("egress") or {}).get("proxy_port", 18877))
-    print("Add this to ~/.claude/settings.json (merge with your existing \"sandbox\" and \"hooks\" keys):\n")
-    print(json.dumps({"sandbox": {"enabled": True, "network": {"httpProxyPort": port, "socksProxyPort": port + 1}}}, indent=2))
-    print("\nThe user-prompt hook starts the proxy when needed; or run `llm-bouncer proxy` yourself.")
-    print("Sandboxed Bash calls then run without command rules; llm-bouncer decides their network and file effects.")
-    return 0
-
-
-def _cmd_show(args: List[str]) -> int:
-    if not args:
-        for sid in ledger.sessions():
-            print(sid)
-        return 0
-    for row in ledger.read_all(args[0]):
-        print(json.dumps(row, ensure_ascii=False))
-    return 0
-
-
 _HOOKS: Dict[str, Callable[[List[str]], int]] = {
     "post-tool-use": _cmd_post_tool_use,
     "user-prompt": _cmd_user_prompt,
     "pre-tool-use": _cmd_pre_tool_use,
-    "show": _cmd_show,
 }
 
 
@@ -486,9 +430,10 @@ def main(argv: Optional[list] = None) -> int:
         from .evals import runner
 
         return runner.main(args[1:])
-    people = {"review": _cmd_review, "grant": _cmd_grant, "grants": _cmd_grants, "setup": _cmd_setup}
-    if cmd in people:  # commands for people: errors should be seen, not swallowed
-        return people[cmd](args[1:])
+    from . import cli
+
+    if cmd in cli.COMMANDS:  # commands for people: errors should be seen, not swallowed
+        return cli.COMMANDS[cmd](args[1:])
     if cmd == "proxy":
         from . import proxy
 

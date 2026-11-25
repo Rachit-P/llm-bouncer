@@ -13,11 +13,13 @@ Set LLM_BOUNCER_UPSTREAM_PROXY=http://host:port to send allowed traffic on throu
 from __future__ import annotations
 
 import asyncio
+import fnmatch
+import json
 import os
 import socket
 import sys
 import time
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from . import effects, ledger, policy
@@ -35,16 +37,108 @@ def _log(host: str, port: int, decision: policy.Decision, kind: str) -> None:
         pass
 
 
+_POLICY_TTL = 5.0
+_policy_at = 0.0
+_states: Dict[str, Tuple[float, int, dict]] = {}  # path -> (mtime, size, summary)
+
+
+def _policy() -> dict:
+    """The proxy is long-lived: pick up policy edits within a few seconds, as the hooks do."""
+    global _policy_at
+    if time.monotonic() - _policy_at > _POLICY_TTL:
+        policy._load.cache_clear()
+        _policy_at = time.monotonic()
+    return policy.load_policy()
+
+
+def _recent_states(minutes: float) -> Dict[str, dict]:
+    """Recently active session summaries, re-parsed only when a file changed.
+
+    Summaries can hold tens of thousands of hashes; parsing all of them on every connection made
+    each connection cost more the longer the sessions ran.
+    """
+    d = ledger.ledger_dir()
+    cutoff = time.time() - minutes * 60
+    out: Dict[str, dict] = {}
+    seen = set()
+    for p in d.glob("*.state.json") if d.exists() else []:
+        key = str(p)
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        if st.st_mtime < cutoff:
+            continue
+        seen.add(key)
+        cached = _states.get(key)
+        if not cached or cached[0] != st.st_mtime or cached[1] != st.st_size:
+            try:
+                summary = json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(summary, dict) or not isinstance(summary.get("sources"), dict):
+                continue
+            _states[key] = cached = (st.st_mtime, st.st_size, summary)
+        out[p.name[: -len(".state.json")]] = cached[2]
+    for key in set(_states) - seen:
+        del _states[key]
+    return out
+
+
 def decide(host: str, port: int, url: Optional[str], kind: str) -> policy.Decision:
     try:
-        pol = policy.load_policy()
+        pol = _policy()
         minutes = float((pol.get("egress") or {}).get("session_window_minutes", 240))
-        d = effects.egress_decision(host, url, ledger.recent_states(minutes), pol)
+        d = effects.egress_decision(host, url, _recent_states(minutes), pol)
     except Exception as exc:  # fail closed: a broken policy or ledger blocks egress
         d = policy.Decision(policy.DENY, f"llm-bouncer: could not check this connection ({exc}).", ["egress", "error"])
     if d.action != policy.ALLOW or d.risk:
         _log(host, port, d, kind)
     return d
+
+
+async def _authorize(host: str, port: int, url: Optional[str], kind: str) -> policy.Decision:
+    d = decide(host, port, url, kind)
+    if d.action == policy.ALLOW:
+        reason = await _check_resolution(host, port)
+        if reason:
+            d = policy.Decision(policy.DENY, reason, ["egress", "local_address"])
+            _log(host, port, d, kind)
+    return d
+
+
+def _local_refusal(host: str, addrs: List[str]) -> Optional[str]:
+    """Refuse names that resolve to this machine or the cloud metadata range.
+
+    Like Claude Code's built-in proxy: a hostname that resolves only to loopback or link-local
+    addresses is a way to reach local services (DNS rebinding), and 169.254.169.254 serves cloud
+    credentials. Names in egress.always_allow (localhost, 127.0.0.1 by default) are exempt.
+    """
+    import ipaddress
+
+    ips = []
+    for a in addrs:
+        try:
+            ips.append(ipaddress.ip_address(a.split("%")[0]))
+        except ValueError:
+            continue
+    if any(ip.is_link_local for ip in ips):
+        return f"llm-bouncer: {host} resolves to a link-local address (cloud metadata range)."
+    if ips and all(ip.is_loopback or ip.is_unspecified for ip in ips):
+        return f"llm-bouncer: {host} resolves to this machine; add it to egress.always_allow if that is intended."
+    return None
+
+
+async def _check_resolution(host: str, port: int) -> Optional[str]:
+    pol = _policy()
+    allow = (pol.get("egress") or {}).get("always_allow") or []
+    if any(fnmatch.fnmatchcase(host.lower(), str(p).lower()) for p in allow) or os.environ.get("LLM_BOUNCER_UPSTREAM_PROXY"):
+        return None  # exempt, or the upstream proxy resolves and applies its own rules
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError:
+        return None  # the connection attempt will fail on its own
+    return _local_refusal(host, [i[4][0] for i in infos])
 
 
 async def _open(host: str, port: int) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
@@ -53,7 +147,14 @@ async def _open(host: str, port: int) -> Tuple[asyncio.StreamReader, asyncio.Str
         return await asyncio.wait_for(asyncio.open_connection(host, port), 30)
     u = urlparse(up)
     r, w = await asyncio.wait_for(asyncio.open_connection(u.hostname, u.port or 8080), 30)
-    w.write(f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n".encode())
+    auth = ""
+    if u.username:
+        import base64
+        from urllib.parse import unquote
+
+        cred = base64.b64encode(f"{unquote(u.username)}:{unquote(u.password or '')}".encode()).decode()
+        auth = f"Proxy-Authorization: Basic {cred}\r\n"
+    w.write(f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n{auth}\r\n".encode())
     await w.drain()
     head = await asyncio.wait_for(r.readuntil(b"\r\n\r\n"), 30)
     if b" 200" not in head.split(b"\r\n", 1)[0]:
@@ -115,7 +216,7 @@ async def handle_http(cr: asyncio.StreamReader, cw: asyncio.StreamWriter) -> Non
         return
     if method.upper() == "CONNECT":
         host, port = _split_hostport(target, 443)
-        d = decide(host, port, None, "connect")
+        d = await _authorize(host, port, None, "connect")
         if d.action != policy.ALLOW:
             cw.write(_refusal(d))
             await cw.drain()
@@ -138,7 +239,7 @@ async def handle_http(cr: asyncio.StreamReader, cw: asyncio.StreamWriter) -> Non
         cw.close()
         return
     host, port = u.hostname, u.port or 80
-    d = decide(host, port, target, "http")
+    d = await _authorize(host, port, target, "http")
     if d.action != policy.ALLOW:
         cw.write(_refusal(d))
         await cw.drain()
@@ -189,7 +290,7 @@ async def handle_socks(cr: asyncio.StreamReader, cw: asyncio.StreamWriter) -> No
         cw.write(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00")
         cw.close()
         return
-    d = decide(host, port, None, "socks")
+    d = await _authorize(host, port, None, "socks")
     if d.action != policy.ALLOW:
         cw.write(fail)
         await cw.drain()
