@@ -421,14 +421,19 @@ def global_grants_path() -> Path:
     return ledger_dir() / "grants.json"
 
 
-def global_grants(now: Optional[float] = None) -> List[str]:
-    """Unexpired grants made with `llm-bouncer grant` (no --session)."""
+def global_grant_rows(now: Optional[float] = None) -> List[dict]:
+    """Unexpired grants made with `llm-bouncer grant` (no --session): [{"target", "expires"}]."""
     now = time.time() if now is None else now
     try:
         rows = json.loads(global_grants_path().read_text(encoding="utf-8")).get("grants", [])
     except (OSError, ValueError, AttributeError):
         return []
-    return [r["target"] for r in rows if isinstance(r, dict) and r.get("expires", 0) > now and isinstance(r.get("target"), str)]
+    return [r for r in rows if isinstance(r, dict) and isinstance(r.get("expires"), (int, float))
+            and r["expires"] > now and isinstance(r.get("target"), str)]
+
+
+def global_grants(now: Optional[float] = None) -> List[str]:
+    return [r["target"] for r in global_grant_rows(now)]
 
 
 def add_global_grants(targets: List[str], hours: float) -> None:
@@ -479,6 +484,31 @@ def read_all(session_id: str, cwd: str | None = None) -> List[dict]:
 
 def next_turn(session_id: str, cwd: str | None = None) -> int:
     return int(read_state(session_id)["turn"]) + 1
+
+
+def read_decisions(session_id: str) -> List[dict]:
+    path = _decisions_path(session_id)
+    out = []
+    try:
+        with path.open(encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(row, dict):
+                    out.append(row)
+    except OSError:
+        pass
+    return out
+
+
+def last_active(session_id: str) -> float:
+    """When the session last wrote its ledger (0 if never)."""
+    try:
+        return ledger_path(session_id).stat().st_mtime
+    except OSError:
+        return 0.0
 
 
 def append_decision(session_id: str, record_: dict, cwd: str | None = None) -> Path:

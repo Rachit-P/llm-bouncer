@@ -6,8 +6,8 @@ import time
 
 import pytest
 
-from llm_bouncer import cli, effects, hooks, integrity, ledger, policy
-from tests.test_effects import SID, _bash_roundtrip, _hook, _pre, _prompt, _web, sandboxed  # noqa: F401
+from llm_bouncer import cli, effects, integrity, ledger, policy
+from tests.test_effects import SID, _bash_roundtrip, _hook, _pre, _prompt, _web, sandboxed  # noqa: F401, F811
 
 
 def _states():
@@ -155,7 +155,8 @@ def test_grants_lists_prompt_grants_separately(monkeypatch, capsys):
     _prompt("install requests", monkeypatch, capsys)
     capsys.readouterr()
     cli.grants([SID])
-    assert "prompt   egress:pypi.org" in capsys.readouterr().out
+    row = next(line for line in capsys.readouterr().out.splitlines() if line.startswith("prompt  egress"))
+    assert "pypi.org" in row
 
 
 def test_setup_keeps_credentials_and_ledger_out_of_the_sandbox(capsys):

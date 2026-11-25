@@ -296,7 +296,7 @@ def test_tainted_command_cannot_change_ci_config(sandboxed, monkeypatch, capsys)
 
     note = _bash_roundtrip(sandboxed, attack, monkeypatch, capsys)
     assert wf.read_text() == "run: pytest\n" and not new.exists()
-    assert "reverted changes to .github/workflows/ci.yml" in note
+    assert "Reverted changes to .github/workflows/ci.yml" in note
 
 
 def test_granted_ci_change_is_kept(sandboxed, monkeypatch, capsys):
@@ -320,7 +320,7 @@ def test_post_hook_tells_the_model_which_hosts_were_blocked(sandboxed, monkeypat
         proxy.decide("collector.evil.example", 443, None, "connect")
 
     note = _bash_roundtrip(sandboxed, blocked, monkeypatch, capsys)
-    assert "blocked connections to collector.evil.example" in note and "llm-bouncer grant collector.evil.example" in note
+    assert "Blocked connections to collector.evil.example" in note and "llm-bouncer grant collector.evil.example" in note
 
 
 def test_setup_prints_sandbox_settings(capsys):

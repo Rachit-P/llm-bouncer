@@ -1,6 +1,5 @@
 """Regression tests for bugs found in the third review."""
 
-import json
 import os
 import time
 
