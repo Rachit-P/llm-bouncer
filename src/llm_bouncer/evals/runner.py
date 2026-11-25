@@ -3,6 +3,11 @@
 A scenario is a short session: what the agent read (tool results, prompts), then one tool call.
 Each case says what the gate should do (`expect`). The runner reports how many attacks were
 blocked, asked about or missed, and how many harmless calls were let through, asked about or blocked.
+
+`--gate effects` scores the effects gate (v0.7): Bash runs in Claude Code's sandbox, so the
+outcome depends on what the command *does*. Those effects are simulated: each case may list them
+(`effects: {egress: [hosts], write: [paths]}`); otherwise they are read from the URLs, write
+targets and a few well-known tools in the command. Expected outcomes are `expect_effects`.
 """
 
 from __future__ import annotations
@@ -18,7 +23,11 @@ from typing import Any, Dict, List, Optional
 
 import yaml
 
-from .. import hooks, ledger, policy
+import fnmatch
+import re
+
+from .. import effects, hooks, ledger, policy
+from ..indicators import extract
 
 ACTIONS = (policy.DENY, policy.ASK, policy.ALLOW)
 
@@ -44,11 +53,63 @@ def load_cases(path: Optional[str] = None) -> List[Dict[str, Any]]:
     return cases
 
 
-def run_case(case: Dict[str, Any], workdir: str) -> policy.Decision:
+# Paths Claude Code's sandbox itself keeps commands from writing (see its "protected paths").
+_SANDBOX_PROTECTED = re.compile(r"(^|/)(\.claude(/|$)|\.claude\.json$|\.mcp\.json$|\.git/(hooks|config)\b|\.gitconfig$"
+                                r"|\.(bash|zsh)rc$|\.profile$|\.vscode/|\.idea/)")
+_IMPLIED_HOSTS = [
+    (re.compile(r"\bgit\b[^|;&]*\bpush\b"), "github.com"),  # the scenarios' origin is on GitHub
+    (re.compile(r"\bgh\s"), "api.github.com"),
+    (re.compile(r"\b(npm\s+(install|i|ci|add|publish)|yarn|pnpm)\b"), "registry.npmjs.org"),
+    (re.compile(r"\b(pip3?\s+install|uv\s+(add|pip))\b"), "pypi.org"),
+]
+
+
+def simulated_effects(case: Dict[str, Any]) -> Dict[str, List[str]]:
+    given = case.get("effects") or {}
+    cmd = str((case["action"].get("input") or {}).get("command", ""))
+    egress = list(given.get("egress") or [])
+    if "egress" not in given:
+        egress += [h for u in extract(cmd).get("urls", []) for h in [effects.urlparse(u).hostname] if h]
+        egress += [h for rx, h in _IMPLIED_HOSTS if rx.search(cmd) and not extract(cmd).get("urls")]
+        egress += [m.group(2) for m in re.finditer(r"\b(dig|nslookup|host)\s+(\S+)", cmd)]
+    write = list(given.get("write") or [])
+    if "write" not in given:
+        write += [t for t in policy._bash_write_targets(cmd) if "/" in t or "." in t]
+    return {"egress": egress, "write": write}
+
+
+def effect_outcome(case: Dict[str, Any], session_id: str, workdir: str, pol: Dict[str, Any]) -> policy.Decision:
+    """What happens when the sandboxed command runs: blocked by the sandbox, the proxy or a revert."""
+    state = ledger.read_state(session_id)
+    tainted = policy.session_status(state, pol)[0] == policy.TAINTED
+    grants = effects.session_grants(state)
+    eff = simulated_effects(case)
+    for w in eff["write"]:
+        rel = w[len("/repo/"):] if w.startswith("/repo/") else w
+        if _SANDBOX_PROTECTED.search(rel) or rel.startswith(("~", "/")) and not rel.startswith("/tmp"):
+            return policy.Decision(policy.DENY, f"sandbox: write to {w} denied", ["sandbox_write"])
+        if tainted and any(fnmatch.fnmatchcase(rel, p) for p in pol.get("integrity_paths") or []) \
+                and not effects.path_granted(rel, grants, "write"):
+            return policy.Decision(policy.DENY, f"integrity: change to {rel} reverted", ["integrity"])
+    for h in eff["egress"]:
+        d = effects.egress_decision(h, None, {session_id: state}, pol)
+        if d.action != policy.ALLOW:
+            return d
+    return policy.Decision(policy.ALLOW, risk=["sandboxed"])
+
+
+def run_case(case: Dict[str, Any], workdir: str, gate: str = "commands") -> policy.Decision:
     session_id = str(case["id"])
+    pol = policy.load_policy()
     for step in case.get("steps", []):
         if "prompt" in step:
             label = hooks.label_user_prompt({"session_id": session_id, "cwd": workdir, "prompt": step["prompt"]})
+            ledger.record(label)
+            if gate == "effects" and not label.flags:
+                grants = effects.grants_from_prompt(step["prompt"], pol, workdir)
+                if grants:
+                    ledger.record_grants(session_id, grants, "prompt")
+            continue
         else:
             label = hooks.label_tool_result(
                 {
@@ -61,34 +122,39 @@ def run_case(case: Dict[str, Any], workdir: str) -> policy.Decision:
             )
         ledger.record(label)
     action = case["action"]
-    return hooks.decide_tool_call(
+    d = hooks.decide_tool_call(
         {"session_id": session_id, "cwd": workdir, "tool_name": action["tool"], "tool_input": action.get("input", {})}
     )
+    if gate == "effects" and d.risk == ["sandboxed"]:
+        return effect_outcome(case, session_id, workdir, pol)
+    return d
 
 
-def run(path: Optional[str] = None, policy_path: Optional[str] = None) -> Dict[str, Any]:
-    saved = {k: os.environ.get(k) for k in ("LLM_BOUNCER_DIR", "LLM_BOUNCER_POLICY")}
+def run(path: Optional[str] = None, policy_path: Optional[str] = None, gate: str = "commands") -> Dict[str, Any]:
+    saved = {k: os.environ.get(k) for k in ("LLM_BOUNCER_DIR", "LLM_BOUNCER_POLICY", "LLM_BOUNCER_GATE")}
     results = []
     try:
         # Without --policy, score the built-in rules: a personal ~/.llm-bouncer/policy.yaml
         # must not change the published numbers or make `eval --check` fail in CI.
         os.environ["LLM_BOUNCER_POLICY"] = str(Path(policy_path).resolve()) if policy_path else policy.BUILTIN
+        os.environ["LLM_BOUNCER_GATE"] = gate
         policy._load.cache_clear()
         for case in load_cases(path):
             with tempfile.TemporaryDirectory() as tmp:
                 os.environ["LLM_BOUNCER_DIR"] = str(Path(tmp) / "ledger")
-                d = run_case(case, tmp)
+                d = run_case(case, tmp, gate)
+            expect = case.get("expect_effects", case.get("expect")) if gate == "effects" else case.get("expect")
             results.append(
                 {
                     "id": case["id"],
                     "group": case["group"],
                     "kind": case["kind"],
                     "known_gap": bool(case.get("known_gap")),
-                    "expect": case.get("expect"),
+                    "expect": expect,
                     "got": d.action,
                     "risk": d.risk,
                     "echoes": d.echoes,
-                    "ok": case.get("expect") in (None, d.action),
+                    "ok": expect in (None, d.action),
                     "description": case.get("description", ""),
                 }
             )
@@ -99,7 +165,7 @@ def run(path: Optional[str] = None, policy_path: Optional[str] = None) -> Dict[s
             else:
                 os.environ[k] = v
         policy._load.cache_clear()
-    return {"summary": summarise(results), "results": results}
+    return {"gate": gate, "summary": summarise(results), "results": results}
 
 
 def summarise(results: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -152,8 +218,23 @@ def main(args: List[str]) -> int:
             print("llm-bouncer eval: --policy needs a file", file=sys.stderr)
             return 2
         policy_path = args[i + 1]
-    rest = [x for i, x in enumerate(args) if not x.startswith("--") and (i == 0 or args[i - 1] != "--policy")]
-    report = run(rest[0] if rest else None, policy_path)
-    print(json.dumps(report, indent=2) if as_json else format_report(report))
+    gates = ["commands"]
+    if "--gate" in args:
+        i = args.index("--gate")
+        choice = args[i + 1] if i + 1 < len(args) else ""
+        if choice not in ("commands", "effects", "both"):
+            print("llm-bouncer eval: --gate needs commands, effects or both", file=sys.stderr)
+            return 2
+        gates = ["commands", "effects"] if choice == "both" else [choice]
+    rest = [x for i, x in enumerate(args) if not x.startswith("--") and (i == 0 or args[i - 1] not in ("--policy", "--gate"))]
+    failed = False
+    for gate in gates:
+        report = run(rest[0] if rest else None, policy_path, gate)
+        if as_json:
+            print(json.dumps(report, indent=2))
+        else:
+            print(f"== {gate} gate" + (" (Bash effects simulated)" if gate == "effects" else ""))
+            print(format_report(report) + "\n")
+        failed |= bool(report["summary"]["expectation_mismatches"])
     # --check: fail when results drift from the expected outcomes (used in CI)
-    return 1 if "--check" in args and report["summary"]["expectation_mismatches"] else 0
+    return 1 if "--check" in args and failed else 0

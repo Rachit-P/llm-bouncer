@@ -13,4 +13,4 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: pip install -e ".[dev]"
       - run: pytest
-      - run: llm-bouncer eval --check
+      - run: llm-bouncer eval --gate both --check

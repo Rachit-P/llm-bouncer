@@ -73,8 +73,8 @@ bouncer_paths:
   - '\.llm-bouncer\b'
   - '\bLLM_BOUNCER_'
   - '\b(pip3?|pipx|uv|conda|python3?\s+-m\s+pip)\b.*\b(uninstall|remove)\b.*\bllm[-_]bouncer\b'
-  # `llm-bouncer review` marks a tainted session as reviewed: only the developer may do that.
-  - '\bllm[-_]bouncer(\.hooks)?\s+review\b'
+  # `llm-bouncer review` / `grant` clear taint or add capabilities: only the developer may do that.
+  - '\bllm[-_]bouncer(\.hooks)?\s+(review|grant)\b'
   # Claude Code settings hold the hooks themselves: removing them switches the gate off.
   - '(^|[\s/''"=>])\.claude/settings(\.local)?\.json\b'
   - '(^|[\s/''"=>])\.claude\.json\b'
@@ -133,3 +133,48 @@ secret_patterns:
   - '\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}'
   - '-----BEGIN [A-Z ]*PRIVATE KEY-----'
 min_secret_entropy: 3.5   # bits per char, for unknown tokens of 20+ chars mixing 3+ character classes
+
+# ---------------------------------------------------------------- effects gate (v0.7)
+# Instead of judging what a shell command *says*, let it run inside Claude Code's sandbox and
+# mediate what it *does*: network egress (through `llm-bouncer proxy`), writes to files that run
+# code later (snapshot, then revert), secret reads and external actions. After untrusted content
+# an effect needs a capability: granted by your typed prompt (see intents) or `llm-bouncer grant`.
+# auto: use the effects gate for Bash calls that run in the sandbox with llm-bouncer's proxy
+# configured, and the command rules above for everything else. effects / commands force one.
+gate: auto
+
+egress:
+  proxy_port: 18877          # set sandbox.network.httpProxyPort to this (`llm-bouncer setup`)
+  session_window_minutes: 240   # sessions active this recently decide the proxy's policy
+  always_allow: [localhost, 127.0.0.1, "::1"]   # never blocked
+  always_deny: []            # blocked even in clean sessions
+  grant_hours: 8             # default lifetime of `llm-bouncer grant` without --session
+
+# Files that change what runs later (CI, builds, test setup, agent instructions). After untrusted
+# content, a sandboxed Bash call that changes one of these without a write grant is reverted.
+# Claude Code's sandbox already protects .claude/, .mcp.json, .git/hooks, .git/config and rc files.
+integrity_paths: [".github/workflows/*", ".github/actions/*/action.y*ml", ".gitlab-ci.yml", ".circleci/config.yml",
+  "package.json", ".npmrc", ".yarnrc", ".yarnrc.yml", "pyproject.toml", "setup.py", "setup.cfg", "conftest.py",
+  "tests/conftest.py", "test/conftest.py", "pytest.ini", "tox.ini", "noxfile.py", "Makefile", "GNUmakefile",
+  "Cargo.toml", "build.rs", ".cargo/config.toml", "Dockerfile", "docker-compose.yml", ".pre-commit-config.yaml",
+  ".envrc", "CLAUDE.md", "AGENTS.md", ".cursorrules"]
+
+# What a typed prompt grants. A URL or domain you type grants egress to its host; a file you name
+# grants writing it. Words that match an intent grant its list. "@git-remotes" means the hosts of
+# this repo's git remotes. Pasted prompts with hidden content grant nothing.
+intents:
+  - match: '\b(install|add(ing)?\s+(a\s+)?(dep|dependency|dependencies|package|library)|upgrade|bump|update\s+(the\s+)?(deps|dependencies|packages))\b'
+    grants: [egress:pypi.org, egress:files.pythonhosted.org, egress:registry.npmjs.org, egress:registry.yarnpkg.com,
+      egress:crates.io, egress:index.crates.io, egress:static.crates.io, egress:proxy.golang.org, egress:sum.golang.org,
+      egress:rubygems.org, write:package.json, write:package-lock.json, write:yarn.lock, write:pnpm-lock.yaml,
+      write:pyproject.toml, "write:requirements*.txt", write:poetry.lock, write:uv.lock, write:Cargo.toml,
+      write:Cargo.lock, write:go.mod, write:go.sum, write:Gemfile, write:Gemfile.lock]
+  - match: '\b(push|pull request|open\s+(a\s+)?pr|create\s+(a\s+)?pr|merge|release|tag)\b'
+    grants: [egress:@git-remotes, egress:github.com, egress:api.github.com, egress:gitlab.com]
+  - match: '\b(fetch|pull|clone|rebase on|sync with)\b'
+    grants: [egress:@git-remotes]
+  - match: '\b(ci|workflow|workflows|github actions|pipeline)\b'
+    grants: ["write:.github/workflows/*", "write:.github/actions/*/action.y*ml", write:.gitlab-ci.yml, write:.circleci/config.yml]
+  - match: '\b(makefile|dockerfile|docker|compose|pre-commit|test setup|conftest|tox|nox|build\s+(script|config|file|system))\b'
+    grants: [write:Makefile, write:GNUmakefile, write:Dockerfile, write:docker-compose.yml, write:.pre-commit-config.yaml,
+      write:conftest.py, write:tests/conftest.py, write:tox.ini, write:noxfile.py, write:pytest.ini, write:setup.cfg]
