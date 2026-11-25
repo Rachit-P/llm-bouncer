@@ -225,8 +225,24 @@ def test_proxy_blocks_connect_after_untrusted_content_and_logs_it(running_proxy,
     assert "secret-data.evil.example" in log
 
 
+def _allow_local(monkeypatch):
+    """The test server is on 127.0.0.1, which the proxy refuses unless it is in always_allow."""
+    async def none(host, port):
+        return None
+    monkeypatch.setattr(proxy, "_check_resolution", none)
+
+
+def test_proxy_refuses_local_and_metadata_addresses(running_proxy):
+    port, web = running_proxy
+    out = _raw(port, f"CONNECT 127.0.0.1:{web} HTTP/1.1\r\n\r\n".encode())
+    assert out.startswith(b"HTTP/1.1 403") and b"resolves to this machine" in out
+    assert proxy._local_refusal("meta.example", ["169.254.169.254"]) and proxy._local_refusal("x", ["::1"])
+    assert proxy._local_refusal("ok.example", ["93.184.216.34"]) is None
+
+
 def test_proxy_forwards_granted_plain_http(running_proxy, monkeypatch, capsys):
     port, web = running_proxy
+    _allow_local(monkeypatch)
     _web(monkeypatch, capsys)
     req = f"GET http://127.0.0.1:{web}/ok HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".encode()
     assert _raw(port, req).startswith(b"HTTP/1.1 403")
@@ -235,8 +251,9 @@ def test_proxy_forwards_granted_plain_http(running_proxy, monkeypatch, capsys):
     assert b"200" in out.split(b"\r\n", 1)[0] and out.endswith(b"hello /ok")
 
 
-def test_proxy_connect_tunnel_when_clean(running_proxy):
+def test_proxy_connect_tunnel_when_clean(running_proxy, monkeypatch):
     port, web = running_proxy
+    _allow_local(monkeypatch)
     with socket.create_connection(("127.0.0.1", port), timeout=5) as c:
         c.sendall(f"CONNECT 127.0.0.1:{web} HTTP/1.1\r\n\r\n".encode())
         assert c.recv(1024).startswith(b"HTTP/1.1 200")

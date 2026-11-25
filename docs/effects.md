@@ -50,8 +50,8 @@ PostToolUse      ─ revert ungranted integrity changes; tell the model which ho
 
 | Gate | Attacks caught | Blocked outright | Harmless asked | Harmless blocked (grantable) |
 |---|---|---|---|---|
-| commands (v0.6) | 38 / 43 (88%) | 12 / 43 (28%) | 7 / 19 (37%) | 1 / 19 (5%) |
-| effects (v0.7) | 39 / 43 (91%) | 29 / 43 (67%) | 0 / 19 | 4 / 19 (21%) |
+| commands (v0.6) | 39 / 44 (89%) | 13 / 44 (30%) | 7 / 19 (37%) | 1 / 19 (5%) |
+| effects (v0.7) | 40 / 44 (91%) | 30 / 44 (68%) | 0 / 19 | 4 / 19 (21%) |
 
 Harmless work stopped by something falls from 8 of 19 to 4 of 19, and those 4 are network calls to
 hosts nobody named (`pip install` with no prompt, a `curl` to an API, the rustup installer), each
@@ -65,13 +65,26 @@ proxy.
 
 ## Limits
 
-* **Needs the sandbox.** Without `sandbox.enabled` and `httpProxyPort` pointing at the proxy, or for
-  unsandboxed retries and `excludedCommands`, Bash falls back to the v0.6 command rules. A
-  repository's settings can only push calls back to those rules, never away from them.
+* **Needs the sandbox.** The effects gate applies only when `sandbox.enabled` is on and *both*
+  `httpProxyPort` and `socksProxyPort` point at the proxy (a SOCKS port left to the built-in proxy
+  would be a second, taint-blind way out), and llm-bouncer's ledger is outside the project or in
+  `filesystem.denyWrite`. Settings are read from the project root, also when the hook runs in a
+  subfolder. Unsandboxed retries, `excludedCommands` (also inside `a && b`), background commands
+  and `gate: commands` fall back to the v0.6 command rules. A repository's settings can only push
+  calls back to those rules, never away from them.
+* **A page you ask to read is not a place to send data.** A host granted only because your prompt
+  named it does not count if untrusted content was read from that host: "summarise
+  https://blog.example/post" lets the agent fetch the post, not post your files back to the blog.
+  `llm-bouncer grant blog.example` overrides this.
+* **Local addresses.** Like the built-in proxy, names that resolve only to this machine or to the
+  link-local range (cloud metadata at 169.254.169.254) are refused unless in `egress.always_allow`.
+* **WebFetch is not capability-gated.** It is a read tool and keeps the v0.6 checks (data or
+  secrets in the URL, echoes); only Bash egress needs a grant.
 * **Host-level for HTTPS.** The proxy sees the hostname, not the URL or body. Data sent to a host
   you granted (your own GitHub, a registry you can publish to) is not inspected.
 * **One proxy, many sessions.** The proxy cannot tell which session a connection comes from. If
-  any session active in the last 4 hours is tainted, all of them are held to grants.
+  any session active in the last 4 hours is tainted, all of them are held to grants, and a grant
+  in one session lets every session's commands reach that host.
 * **Prompt grants trust the prompt.** Pasted text in a prompt is not yet told apart from typed
   text; prompts with hidden characters are ignored, but plain pasted text can still grant.
 * **Revert is after the fact.** A changed CI file is restored when the command ends, so a command

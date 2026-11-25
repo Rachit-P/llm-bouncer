@@ -139,8 +139,9 @@ min_secret_entropy: 3.5   # bits per char, for unknown tokens of 20+ chars mixin
 # mediate what it *does*: network egress (through `llm-bouncer proxy`), writes to files that run
 # code later (snapshot, then revert), secret reads and external actions. After untrusted content
 # an effect needs a capability: granted by your typed prompt (see intents) or `llm-bouncer grant`.
-# auto: use the effects gate for Bash calls that run in the sandbox with llm-bouncer's proxy
-# configured, and the command rules above for everything else. effects / commands force one.
+# auto: use the effects gate for Bash calls that run in the sandbox with both of llm-bouncer's proxy
+# ports configured (`llm-bouncer setup`), and the command rules above for everything else.
+# commands: never use the effects gate.
 gate: auto
 
 egress:

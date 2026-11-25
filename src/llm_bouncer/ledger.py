@@ -36,7 +36,8 @@ except ImportError:  # Windows: no advisory locks; writes are still single os.wr
 from .labels import Label
 from .textnorm import key_hash, norm, url_key
 
-STATE_VERSION = 2  # 2: per-source last_turn, stamped taint, review rows
+STATE_VERSION = 3  # 2: per-source last_turn, stamped taint, review rows; 3: prompt grants kept apart, origin hosts
+MAX_HOSTS = 200  # hosts untrusted content was read from, per source type
 MAX_ORIGINS = 3
 MAX_COMMANDS = 5000  # per source type; the oldest are dropped first
 MAX_READABLE = 50  # recent URLs/emails kept as text, for `show` and reasons
@@ -159,7 +160,9 @@ def empty_state() -> dict:
     # taints: source types that tainted the session under the policy in force when they were
     # read. Kept so that later removing a source from taint_sources cannot un-taint old sessions.
     # reviewed_turn: the developer marked everything up to this turn as reviewed (`review`).
-    return {"v": STATE_VERSION, "turn": 0, "sources": {}, "taints": [], "reviewed_turn": 0}
+    # grants: capabilities you gave with `llm-bouncer grant --session`. prompt_grants: capabilities
+    # read from your typed prompts; they are weaker (see effects.egress_decision).
+    return {"v": STATE_VERSION, "turn": 0, "sources": {}, "taints": [], "reviewed_turn": 0, "grants": [], "prompt_grants": []}
 
 
 def _fold(state: dict, row: dict, evicted: Optional[List[str]] = None) -> None:
@@ -173,7 +176,7 @@ def _fold(state: dict, row: dict, evicted: Optional[List[str]] = None) -> None:
         state["reviewed_turn"] = max(int(state.get("reviewed_turn", 0)), turn)
         return
     if row.get("event") == "grant":
-        grants = state.setdefault("grants", [])
+        grants = state.setdefault("prompt_grants" if row.get("source") == "prompt" else "grants", [])
         grants.extend(g for g in row.get("grants") or [] if isinstance(g, str) and g not in grants)
         return
     stype = str(row.get("source_type"))
@@ -185,6 +188,9 @@ def _fold(state: dict, row: dict, evicted: Optional[List[str]] = None) -> None:
     origin = str(row.get("origin", "?"))
     origins = [o for o in src["origins"] if o != origin] + [origin]
     src["origins"] = origins[-MAX_ORIGINS:]
+    host = _origin_host(origin)
+    if host:
+        src["hosts"] = _recent(src.get("hosts", []), [host], MAX_HOSTS)
     for kind, items in (row.get("indicators") or {}).items():
         if kind not in _KINDS:
             continue
@@ -199,6 +205,17 @@ def _fold(state: dict, row: dict, evicted: Optional[List[str]] = None) -> None:
             src[kind[:-1] + "_h"] = _recent(src.get(kind[:-1] + "_h", []), [key_hash(keyf(i)) for i in items], MAX_HASHES, dropped)
             if dropped:
                 evicted.extend(f"{stype} {kind[0]} {h}" for h in dropped)
+
+
+def _origin_host(origin: str) -> str:
+    if "://" not in origin:
+        return ""
+    from urllib.parse import urlparse
+
+    try:
+        return (urlparse(origin.strip()).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return ""
 
 
 def _recent(have: List[str], new: List[str], cap: int, dropped: Optional[List[str]] = None) -> List[str]:

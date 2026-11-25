@@ -69,6 +69,24 @@ def _validate(pol: Dict[str, Any]) -> Dict[str, Any]:
             raise PolicyError(f"{key} must be one of {_ACTIONS}, got {pol.get(key)!r}")
     if pol.get("tainted_mode", "allowlist") not in ("allowlist", "denylist"):
         raise PolicyError(f"tainted_mode must be allowlist or denylist, got {pol.get('tainted_mode')!r}")
+    if pol.get("gate", "auto") not in ("auto", "commands"):
+        raise PolicyError(f"gate must be auto or commands, got {pol.get('gate')!r}")
+    eg = pol.get("egress") or {}
+    if not isinstance(eg, dict) or not isinstance(eg.get("proxy_port", 18877), int) \
+            or not all(isinstance(eg.get(k, []), list) for k in ("always_allow", "always_deny")):
+        raise PolicyError("egress must be a mapping with an integer proxy_port and always_allow/always_deny lists")
+    if not all(isinstance(p, str) for p in pol.get("integrity_paths") or []):
+        raise PolicyError("integrity_paths must be a list of glob strings")
+    for intent in pol.get("intents") or []:
+        if not isinstance(intent, dict) or not isinstance(intent.get("grants", []), list):
+            raise PolicyError(f"each intent needs a match regex and a grants list, got {intent!r}")
+        try:
+            re.compile(str(intent.get("match", "")))
+        except re.error as exc:
+            raise PolicyError(f"bad intent regex {intent.get('match')!r}: {exc}") from exc
+        for g in intent.get("grants") or []:
+            if not isinstance(g, str) or g.split(":", 1)[0] not in ("egress", "write", "read", "mcp") or ":" not in g:
+                raise PolicyError(f"intent grant must look like egress:HOST, write:PATH, read:PATH or mcp:TOOL, got {g!r}")
     try:
         for patterns in (pol.get("bash_risky") or {}).values():
             for p in patterns or []:
